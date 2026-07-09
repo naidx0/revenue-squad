@@ -185,9 +185,27 @@ def test_skills_dir_packaged_next(tmp_path, monkeypatch):
     assert runner._skills_dir().resolve() == packaged_skills.resolve()
 
 
-def test_skills_dir_all_missing_raises_naming_all_three(tmp_path, monkeypatch):
+def test_skills_dir_env_missing_raises_even_when_fallback_exists(tmp_path, monkeypatch):
+    # An explicit override that doesn't exist must raise — never silently fall
+    # through to a fallback that does (a typo would run the wrong skills).
     env_dir = tmp_path / "missing-env-skills"  # set but does not exist
     monkeypatch.setenv("SQUAD_SKILLS_DIR", str(env_dir))
+    base = tmp_path / "repo" / "src" / "revenue_squad"
+    base.mkdir(parents=True)
+    repo_skills = tmp_path / "repo" / "skills"
+    repo_skills.mkdir()  # valid fallback exists — must still raise
+    monkeypatch.setattr(runner, "__file__", str(base / "runner.py"))
+
+    with pytest.raises(RunnerError) as excinfo:
+        runner._skills_dir()
+
+    msg = str(excinfo.value)
+    assert "SQUAD_SKILLS_DIR" in msg
+    assert str(env_dir) in msg
+
+
+def test_skills_dir_fallbacks_missing_raises_naming_both(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQUAD_SKILLS_DIR", raising=False)
     base = tmp_path / "x" / "y" / "revenue_squad"
     monkeypatch.setattr(runner, "__file__", str(base / "runner.py"))
 
@@ -196,6 +214,5 @@ def test_skills_dir_all_missing_raises_naming_all_three(tmp_path, monkeypatch):
 
     msg = str(excinfo.value)
     resolved = Path(str(base / "runner.py")).resolve()
-    assert str(env_dir) in msg  # (1) env candidate
-    assert str(resolved.parents[2] / "skills") in msg  # (2) repo-root candidate
-    assert str(resolved.parent / "skills") in msg  # (3) packaged candidate
+    assert str(resolved.parents[2] / "skills") in msg  # repo-root candidate
+    assert str(resolved.parent / "skills") in msg  # packaged candidate

@@ -26,19 +26,29 @@ class RunnerError(RuntimeError):
 def _skills_dir() -> Path:
     """Resolve the skills directory by ordered resource lookup, first existing wins.
 
-    Order: (1) $SQUAD_SKILLS_DIR, (2) the repo-root skills/ of a source checkout
-    (src/revenue_squad/runner.py -> parents[2] is the repo root), (3) skills/ shipped
-    inside the wheel at revenue_squad/skills (see pyproject force-include). If none of
-    them exist, raise loudly listing every path tried (AGENTS.md §5: ordered resolution
-    with a loud terminal failure, not a silent fallback).
+    Order: (1) $SQUAD_SKILLS_DIR — authoritative when set: used if it exists, loud
+    error if it doesn't (explicit configuration is never silently skipped);
+    (2) the repo-root skills/ of a source checkout (src/revenue_squad/runner.py ->
+    parents[2] is the repo root); (3) skills/ shipped inside the wheel at
+    revenue_squad/skills (see pyproject force-include). If neither fallback exists,
+    raise loudly listing every path tried (AGENTS.md §5).
     """
     here = Path(__file__).resolve()
-    candidates: list[Path] = []
     override = os.environ.get("SQUAD_SKILLS_DIR")
     if override:
-        candidates.append(Path(override))
-    candidates.append(here.parents[2] / "skills")  # source checkout, repo root
-    candidates.append(here.parent / "skills")  # packaged inside the wheel
+        # An explicit override is authoritative: use it or fail — never fall
+        # through to another candidate on a typo or unmounted path.
+        path = Path(override)
+        if path.is_dir():
+            return path
+        raise RunnerError(
+            f"SQUAD_SKILLS_DIR is set to {path} but that is not a directory. "
+            "Fix or unset it; explicit configuration is never silently ignored."
+        )
+    candidates = [
+        here.parents[2] / "skills",  # source checkout, repo root
+        here.parent / "skills",  # packaged inside the wheel
+    ]
     for candidate in candidates:
         if candidate.is_dir():
             return candidate
