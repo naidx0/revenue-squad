@@ -8,3 +8,4 @@ blocklist.txt
 dist/
 .env
 .env.local
+!examples/**/pipeline.csv
