@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "revenue-squad"
+version = "0.1.0"
+description = "Solo-operator outbound B2B workflow (research -> outreach -> proposal) driven by the Claude CLI, with a verified-emails-only local CSV pipeline."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "naidx0" }]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "dnspython>=2.6",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+]
+
+[project.scripts]
+squad = "revenue_squad.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/revenue_squad"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

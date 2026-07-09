@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Sync
+        run: uv sync --all-extras
+      - name: Test
+        run: uv run pytest -q --timeout=60 --timeout-method=thread --durations=10 --durations-min=1
+      - name: CLI help
+        run: uv run squad --help
