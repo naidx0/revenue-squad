@@ -6,3 +6,5 @@ blocklist.txt
 .pytest_cache/
 *.egg-info
 dist/
+.env
+.env.local
