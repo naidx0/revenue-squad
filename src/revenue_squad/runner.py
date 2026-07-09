@@ -24,11 +24,31 @@ class RunnerError(RuntimeError):
 
 
 def _skills_dir() -> Path:
+    """Resolve the skills directory by ordered resource lookup, first existing wins.
+
+    Order: (1) $SQUAD_SKILLS_DIR, (2) the repo-root skills/ of a source checkout
+    (src/revenue_squad/runner.py -> parents[2] is the repo root), (3) skills/ shipped
+    inside the wheel at revenue_squad/skills (see pyproject force-include). If none of
+    them exist, raise loudly listing every path tried (AGENTS.md §5: ordered resolution
+    with a loud terminal failure, not a silent fallback).
+    """
+    here = Path(__file__).resolve()
+    candidates: list[Path] = []
     override = os.environ.get("SQUAD_SKILLS_DIR")
     if override:
-        return Path(override)
-    # src/revenue_squad/runner.py -> parents[2] is the repo root.
-    return Path(__file__).resolve().parents[2] / "skills"
+        candidates.append(Path(override))
+    candidates.append(here.parents[2] / "skills")  # source checkout, repo root
+    candidates.append(here.parent / "skills")  # packaged inside the wheel
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    tried = "\n".join(f"  - {p}" for p in candidates)
+    raise RunnerError(
+        "skills directory not found. Tried (in order):\n"
+        f"{tried}\n"
+        "Set SQUAD_SKILLS_DIR to point at a directory containing "
+        "research/, outreach/, and proposal/ SKILL.md files."
+    )
 
 
 _FRONTMATTER = re.compile(r"---[ \t]*\r?\n.*?\r?\n---[ \t]*\r?\n?", re.DOTALL)

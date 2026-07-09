@@ -29,6 +29,15 @@ squad = "revenue_squad.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/revenue_squad"]
 
+# The repo-root skills/ dir is a product feature (readable, drop-in Claude Code
+# skills), so it stays at the root — but it must also ride inside the wheel, or a
+# pip/uv-tool install has no skills to load. Ship a copy at revenue_squad/skills.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "revenue_squad/skills"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "slow: marks tests that build artifacts or are otherwise slow (deselect with '-m \"not slow\"')",
+]

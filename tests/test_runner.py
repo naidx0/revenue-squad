@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -150,3 +151,51 @@ def test_run_skill_unknown_skill_raises(skills_dir, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(RunnerError, match="skill not found"):
         run_skill("t", "nonexistent")
+
+
+# --- _skills_dir resolver order: env -> repo-root -> packaged -> loud raise ---
+
+
+def test_skills_dir_env_wins(tmp_path, monkeypatch):
+    env_dir = tmp_path / "env-skills"
+    env_dir.mkdir()
+    monkeypatch.setenv("SQUAD_SKILLS_DIR", str(env_dir))
+    assert runner._skills_dir() == env_dir
+
+
+def test_skills_dir_repo_root_next(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQUAD_SKILLS_DIR", raising=False)
+    repo_root = tmp_path / "repo"
+    repo_skills = repo_root / "skills"
+    repo_skills.mkdir(parents=True)
+    # runner.py lives at <repo>/src/revenue_squad/runner.py; parents[2] is the repo root.
+    monkeypatch.setattr(
+        runner, "__file__", str(repo_root / "src" / "revenue_squad" / "runner.py")
+    )
+    assert runner._skills_dir().resolve() == repo_skills.resolve()
+
+
+def test_skills_dir_packaged_next(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQUAD_SKILLS_DIR", raising=False)
+    # Installed layout: no repo-root skills/, but skills/ sits beside runner.py.
+    pkg = tmp_path / "site-packages" / "revenue_squad"
+    packaged_skills = pkg / "skills"
+    packaged_skills.mkdir(parents=True)
+    monkeypatch.setattr(runner, "__file__", str(pkg / "runner.py"))
+    assert runner._skills_dir().resolve() == packaged_skills.resolve()
+
+
+def test_skills_dir_all_missing_raises_naming_all_three(tmp_path, monkeypatch):
+    env_dir = tmp_path / "missing-env-skills"  # set but does not exist
+    monkeypatch.setenv("SQUAD_SKILLS_DIR", str(env_dir))
+    base = tmp_path / "x" / "y" / "revenue_squad"
+    monkeypatch.setattr(runner, "__file__", str(base / "runner.py"))
+
+    with pytest.raises(RunnerError) as excinfo:
+        runner._skills_dir()
+
+    msg = str(excinfo.value)
+    resolved = Path(str(base / "runner.py")).resolve()
+    assert str(env_dir) in msg  # (1) env candidate
+    assert str(resolved.parents[2] / "skills") in msg  # (2) repo-root candidate
+    assert str(resolved.parent / "skills") in msg  # (3) packaged candidate

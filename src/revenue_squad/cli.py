@@ -140,11 +140,12 @@ def outreach(
     if not rows:
         raise typer.BadParameter(f"{backend.describe()} is empty — run `squad research` first.")
 
-    if companies:
+    explicit = bool(companies)
+    if explicit:
         wanted = {c.strip().lower() for c in companies}
         targets = [r for r in rows if r.get("Company", "").strip().lower() in wanted]
-        missing = wanted - {r.get("Company", "").strip().lower() for r in targets}
-        for name in sorted(missing):
+        missing_from_pipeline = wanted - {r.get("Company", "").strip().lower() for r in targets}
+        for name in sorted(missing_from_pipeline):
             _warn(f"REFUSE {name}: not found in pipeline")
     else:
         targets = [r for r in rows if r.get("Status") == "New"]
@@ -157,10 +158,55 @@ def outreach(
         else:
             _warn(f"REFUSE {row.get('Company', '')}: {reason}")
 
+    prose = ""
+    drafted_keys: set[str] = set()
     if not eligible:
         console.print("No eligible leads to draft.")
-        raise typer.Exit(code=0)
+        # Explicit targets that produced nothing is unfulfilled work, not "nothing to
+        # do": fall through to the loud nonzero exit below. No-args with nothing
+        # eligible is genuinely nothing to do, so exit 0.
+        if not explicit:
+            raise typer.Exit(code=0)
+    else:
+        prose, drafted_keys = _draft_eligible(eligible, sender)
 
+    if explicit:
+        # Every named company must have produced a written draft; anything missing
+        # (absent from pipeline, refused, or no draft returned) is unfulfilled work.
+        seen: set[str] = set()
+        unfulfilled: list[str] = []
+        for name in companies:
+            key = name.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if key not in drafted_keys:
+                unfulfilled.append(name.strip())
+        if unfulfilled:
+            if prose.strip():
+                err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
+            _warn("Unfulfilled — no outreach draft written for: " + ", ".join(unfulfilled))
+            raise typer.Exit(code=1)
+        return
+
+    # No-args mode: eligible leads went in but some/all came back with no draft.
+    missing = [
+        r.get("Company", "")
+        for r in eligible
+        if r.get("Company", "").strip().lower() not in drafted_keys
+    ]
+    if missing:
+        if prose.strip():
+            err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
+        _warn("No outreach draft returned for: " + ", ".join(missing))
+        raise typer.Exit(code=1)
+
+
+def _draft_eligible(
+    eligible: list[dict[str, str]], sender: Optional[str]
+) -> tuple[str, set[str]]:
+    """Run the outreach skill for eligible leads, write each returned draft, and return
+    (model prose, set of drafted Company keys). Any draft that comes back is written."""
     lead_payload = [
         {
             "company": r.get("Company", ""),
@@ -207,20 +253,7 @@ def outreach(
 
     _preview_outreach(written)
     console.print(f"\nWrote {len(written)} outreach file(s) under {out_dir}.")
-
-    # Fail loudly (AGENTS.md §5): eligible leads went in but some/all came back with no
-    # draft. Surface the model's own explanation, name the companies, and exit nonzero.
-    # Any drafts that DID come back are already written above.
-    missing = [
-        r.get("Company", "")
-        for r in eligible
-        if r.get("Company", "").strip().lower() not in drafted_keys
-    ]
-    if missing:
-        if prose.strip():
-            err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
-        _warn("No outreach draft returned for: " + ", ".join(missing))
-        raise typer.Exit(code=1)
+    return prose, drafted_keys
 
 
 @app.command("propose")

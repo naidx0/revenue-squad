@@ -116,6 +116,74 @@ def test_outreach_all_drafted_exits_zero(tmp_path, monkeypatch):
     assert (tmp_path / "out" / "outreach" / "acme.md").exists()
 
 
+def test_outreach_no_args_none_eligible_exits_zero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # A lead that isn't Status=New is not a target in no-args mode -> nothing eligible.
+    # No-args + nothing to do is not a failure: informative message, exit 0.
+    crm.append([_lead("Dormant Co", "x@dormant.com", **{"Status": "Contacted"})])
+
+    def fail(*a, **k):
+        raise AssertionError("run_skill must not run when nothing is eligible")
+
+    monkeypatch.setattr(cli, "run_skill", fail)
+    result = CliRunner().invoke(cli.app, ["outreach"])
+    assert result.exit_code == 0, result.output
+    assert "No eligible leads to draft." in result.output
+
+
+# --- explicitly-named targets: unfulfilled work must exit nonzero (never read as success) ---
+
+
+def test_outreach_explicit_all_refused_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # One named company is in the pipeline but ineligible (no verified email); the other
+    # isn't in the pipeline at all. Both were explicitly requested -> both unfulfilled.
+    crm.append([_lead("Present Co", "")])
+
+    def fail(*a, **k):
+        raise AssertionError("run_skill must not run when nothing is eligible")
+
+    monkeypatch.setattr(cli, "run_skill", fail)
+    result = CliRunner().invoke(cli.app, ["outreach", "Present Co", "Ghost Co"])
+    assert result.exit_code == 1, result.output
+    assert "Unfulfilled" in result.output
+    assert "Present Co" in result.output
+    assert "Ghost Co" in result.output
+
+
+def test_outreach_explicit_partial_writes_one_and_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_eligible("Acme")
+    _seed_eligible("Globex")
+
+    def fake_run_skill(task, skill, **kw):
+        return {"drafts": [_draft("Acme")]}, "Skipped Globex: thin public info."
+
+    monkeypatch.setattr(cli, "run_skill", fake_run_skill)
+    result = CliRunner().invoke(cli.app, ["outreach", "Acme", "Globex"])
+    assert result.exit_code == 1, result.output
+    # The one draft that came back is written...
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()
+    # ...and the unfulfilled named company is surfaced, with no file.
+    assert not (tmp_path / "out" / "outreach" / "globex.md").exists()
+    assert "Globex" in result.output
+
+
+def test_outreach_explicit_all_drafted_exits_zero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_eligible("Acme")
+    _seed_eligible("Globex")
+
+    def fake_run_skill(task, skill, **kw):
+        return {"drafts": [_draft("Acme"), _draft("Globex")]}, ""
+
+    monkeypatch.setattr(cli, "run_skill", fake_run_skill)
+    result = CliRunner().invoke(cli.app, ["outreach", "Acme", "Globex"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()
+    assert (tmp_path / "out" / "outreach" / "globex.md").exists()
+
+
 # --- sender identity: the ambient-identity leak guard (both outreach and propose) ---
 
 
