@@ -270,3 +270,35 @@ def test_create_database_missing_token_raises(monkeypatch):
 
 def test_build_schema_covers_every_column():
     assert set(build_schema().keys()) == set(crm.COLUMNS)
+
+
+def test_email_evidence_is_url_in_schema():
+    # Email Evidence is a url property, sitting right after Email in the schema.
+    props = build_schema()
+    assert props["Email Evidence"] == {"url": {}}
+    cols = list(crm.COLUMNS)
+    assert cols[cols.index("Email") + 1] == "Email Evidence"
+
+
+def test_email_evidence_encodes_and_decodes():
+    captured = {}
+
+    def handler(request):
+        if request.url.path.endswith("/query"):
+            return httpx.Response(200, json={"results": [], "has_more": False})
+        captured.update(json.loads(request.content)["properties"])
+        return httpx.Response(200, json={"id": "new"})
+
+    row = {**crm.empty_row(), "Company": "Acme", "Email": "a@acme.com",
+           "Email Evidence": "https://acme.com/team"}
+    _backend(handler).append([row])
+    assert captured["Email Evidence"] == {"url": "https://acme.com/team"}
+
+    # And it decodes back off a queried page.
+    def load_handler(request):
+        return httpx.Response(200, json={"results": [
+            _page("Acme", **{"Email Evidence": {"url": "https://acme.com/team"}}),
+        ], "has_more": False})
+
+    rows = _backend(load_handler).load()
+    assert rows[0]["Email Evidence"] == "https://acme.com/team"

@@ -67,11 +67,24 @@ def test_happy_path_maps_fields():
     row = rows[0]
     assert row["Company"] == "Acme"
     assert row["Email"] == "jane@acme.com"
+    assert row["Email Evidence"] == "https://acme.com/team"
     assert row["Status"] == "New"
     assert row["Service Line"] == "SEO"
     assert row["Batch"] == "dentists-2026-07-09"
     assert row["Lead Score"] == "8"
     assert row["Contact"] == "Jane"
+
+
+def test_evidence_dropped_when_email_demoted_for_mx():
+    # A surviving email carries its evidence; a demoted email leaves the column blank.
+    rows, _ = _process([_lead()], mx=_mx_fail)
+    assert rows[0]["Email"] == ""
+    assert rows[0]["Email Evidence"] == ""
+
+
+def test_evidence_blank_when_no_email():
+    rows, _ = _process([_lead(email=None, email_evidence_url=None)])
+    assert rows[0]["Email Evidence"] == ""
 
 
 def test_blocklisted_email_drops_lead():
@@ -136,7 +149,13 @@ def _row(**over):
     from revenue_squad import crm
 
     row = crm.empty_row()
-    row.update({"Company": "Acme", "Email": "jane@acme.com", "Website": "https://acme.com", "Status": "New"})
+    row.update({
+        "Company": "Acme",
+        "Email": "jane@acme.com",
+        "Email Evidence": "https://acme.com/team",
+        "Website": "https://acme.com",
+        "Status": "New",
+    })
     row.update(over)
     return row
 
@@ -159,6 +178,14 @@ def test_refuse_lost():
 def test_refuse_no_email():
     ok, reason = pipeline.outreach_eligibility(_row(Email=""), _empty_blocklist())
     assert ok is False and "no verified email" in reason
+
+
+def test_refuse_no_evidence():
+    # Email present but Email Evidence blank -> same refusal (both are required).
+    ok, reason = pipeline.outreach_eligibility(
+        _row(**{"Email Evidence": ""}), _empty_blocklist()
+    )
+    assert ok is False and "no verified email (with evidence)" in reason
 
 
 def test_refuse_blocklisted_email():

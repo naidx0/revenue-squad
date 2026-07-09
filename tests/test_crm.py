@@ -16,8 +16,10 @@ def _lead(company, email="", **extra):
 def test_columns_exact_order():
     assert crm.COLUMNS[0] == "Company"
     assert crm.COLUMNS[-1] == "Blocked"
-    assert len(crm.COLUMNS) == 23
+    assert len(crm.COLUMNS) == 24
     assert "Service Line" in crm.COLUMNS
+    # Email Evidence sits immediately after Email.
+    assert crm.COLUMNS[crm.COLUMNS.index("Email") + 1] == "Email Evidence"
 
 
 def test_roundtrip(tmp_path):
@@ -33,6 +35,23 @@ def test_roundtrip(tmp_path):
 
 def test_load_missing_file_returns_empty(tmp_path):
     assert crm.load(tmp_path / "nope.csv") == []
+
+
+def test_load_rejects_mismatched_header(tmp_path):
+    # A pipeline.csv from an older column set (no "Email Evidence") must fail loudly,
+    # not silently default the missing column.
+    path = tmp_path / "pipeline.csv"
+    stale = [c for c in crm.COLUMNS if c != "Email Evidence"]
+    path.write_text(",".join(stale) + "\nAcme,Jane,a@acme.com,555,Denver,,New,,,,,,,,,,,,,,,\n")
+    with pytest.raises(ValueError, match="does not match the current CRM schema"):
+        crm.load(path)
+
+
+def test_load_roundtrip_header_matches(tmp_path):
+    # A file written by save() always loads back cleanly (header == COLUMNS).
+    path = tmp_path / "pipeline.csv"
+    crm.save([_lead("Acme", "a@acme.com")], path)
+    assert crm.load(path)[0]["Company"] == "Acme"
 
 
 def test_append_dedupes_by_company_and_email(tmp_path):

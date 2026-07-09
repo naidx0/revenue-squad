@@ -8,6 +8,7 @@ from revenue_squad.runner import (
     extract_last_json_block,
     run_skill,
     strip_frontmatter,
+    strip_json_blocks,
 )
 from tests.conftest import make_proc
 
@@ -49,6 +50,22 @@ def test_run_skill_parses_envelope_and_block(skills_dir, monkeypatch, tmp_path):
     )
     out = run_skill("do research", "research", allowed_tools=["WebSearch"])
     assert out == {"leads": []}
+
+
+def test_strip_json_blocks_returns_prose_only():
+    text = "Why I refused: no evidence.\n```json\n{\"drafts\": []}\n```\nEnd."
+    assert strip_json_blocks(text) == "Why I refused: no evidence.\n\nEnd."
+
+
+def test_run_skill_return_prose_gives_block_and_prose(skills_dir, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    result_text = "I could not draft: no verified email.\n```json\n{\"drafts\": []}\n```"
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda *a, **k: make_proc(0, _envelope(result_text))
+    )
+    block, prose = run_skill("draft", "outreach", return_prose=True)
+    assert block == {"drafts": []}
+    assert prose == "I could not draft: no verified email."
 
 
 def test_run_skill_propose_returns_text(skills_dir, monkeypatch, tmp_path):

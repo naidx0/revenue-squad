@@ -86,6 +86,7 @@ def process_research_leads(
         lead = _normalize_lead(raw)
         company = lead["company"].strip()
         email = (lead.get("email") or "").strip()
+        evidence = (lead.get("email_evidence_url") or "").strip()
         website = (lead.get("website") or "").strip()
         site_domain = domain_of(website)
 
@@ -119,6 +120,8 @@ def process_research_leads(
                 "Company": company,
                 "Contact": (lead.get("contact_name") or "").strip(),
                 "Email": email,
+                # Evidence only rides along with an email that survived validation.
+                "Email Evidence": evidence if email else "",
                 "Phone": (lead.get("phone") or "").strip(),
                 "City": (lead.get("city") or "").strip(),
                 "Website": website,
@@ -193,7 +196,10 @@ def outreach_eligibility(
     if (row.get("Status") or "").strip() == "Lost":
         return (False, "status is Lost")
     email = (row.get("Email") or "").strip()
-    if not email:
+    evidence = (row.get("Email Evidence") or "").strip()
+    # A lead is only workable with BOTH a surviving email and the evidence URL
+    # proving it was seen on a real page — missing either is the same refusal.
+    if not email or not evidence:
         return (False, "no verified email (with evidence)")
     if blocklist.is_blocked(email):
         return (False, "email is blocklisted")

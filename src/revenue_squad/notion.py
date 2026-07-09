@@ -38,6 +38,7 @@ PROPERTY_TYPES = {
     "Company": "title",
     "Contact": "rich_text",
     "Email": "email",
+    "Email Evidence": "url",
     "Phone": "phone_number",
     "City": "rich_text",
     "Website": "url",

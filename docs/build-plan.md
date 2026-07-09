@@ -9,7 +9,7 @@
 | Language/packaging | Python ≥3.11, `uv`, Typer CLI, hatchling | Mirrors naidx0/localleadfinder, the operator's existing OSS precedent |
 | Claude mechanism | `subprocess` → `claude -p <task> --append-system-prompt-file <skill> --allowedTools ... --output-format json` | Verified available in claude CLI 2.1.186 on this machine |
 | Skills | `skills/{research,outreach,proposal}/SKILL.md`, markdown with `name`+`description` frontmatter | Double as drop-in Claude Code skills (the operator's chosen packaging). Runner strips frontmatter when composing the headless prompt |
-| CRM default | `pipeline.csv`, columns mirroring Sequence's real Notion "Master Lead CRM" | Zero-dependency, provable today |
+| CRM default | `pipeline.csv`, columns mirroring Sequence's real Notion "Master Lead CRM" **plus an `Email Evidence` URL column** | Zero-dependency, provable today. Evidence column added after live Phase 3 proof: research validated `email_evidence_url` then discarded it, so outreach (correctly) refused every lead — verified-with-evidence must survive the CRM round-trip |
 | CRM adapter | Notion REST API (httpx, `NOTION_TOKEN`), incl. `squad notion-init` to create a compatible DB | Deterministic; no LLM in the CRM write path; fails loudly without token |
 | Lead seeding | Optional Google Places seed (`GOOGLE_MAPS_API_KEY`), same API pattern as localleadfinder | the operator explicitly wants "attach your Google API"; optional, not required |
 | Gmail | NOT in v1. Drafts are files; `squad mark-sent` records sends. Bounce history = operator-maintained `blocklist.txt` | No OAuth scope in v1; README states this honestly as roadmap |

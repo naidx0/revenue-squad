@@ -13,6 +13,7 @@ COLUMNS = [
     "Company",
     "Contact",
     "Email",
+    "Email Evidence",
     "Phone",
     "City",
     "Website",
@@ -60,7 +61,20 @@ def load(path: Path | str = DEFAULT_PATH) -> list[dict[str, str]]:
     if not path.is_file():
         return []
     with path.open(newline="") as fh:
-        return [_conform(row) for row in csv.DictReader(fh)]
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames
+        # Strict forward-compat: a header that doesn't match COLUMNS exactly is a
+        # schema mismatch (e.g. a pipeline.csv from an older column set). Fail loudly
+        # instead of silently defaulting the missing/extra columns (AGENTS.md §5).
+        if header is not None and list(header) != COLUMNS:
+            raise ValueError(
+                f"{path} header does not match the current CRM schema.\n"
+                f"  expected: {COLUMNS}\n"
+                f"  found:    {list(header)}\n"
+                "Regenerate the pipeline (re-run `squad research`) or migrate the file "
+                "to the current columns."
+            )
+        return [_conform(row) for row in reader]
 
 
 def save(rows: list[dict[str, str]], path: Path | str = DEFAULT_PATH) -> None:

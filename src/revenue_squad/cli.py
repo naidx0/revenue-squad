@@ -128,10 +128,14 @@ def outreach(
             "company": r.get("Company", ""),
             "contact": r.get("Contact", ""),
             "email": r.get("Email", ""),
-            "city": r.get("City", ""),
+            "email_evidence": r.get("Email Evidence", ""),
             "website": r.get("Website", ""),
+            "city": r.get("City", ""),
             "vertical": r.get("Vertical", ""),
             "service_line": r.get("Service Line", ""),
+            "lead_score": r.get("Lead Score", ""),
+            "score_rationale": r.get("Score Rationale", ""),
+            "notes": r.get("Notes", ""),
         }
         for r in eligible
     ]
@@ -140,7 +144,7 @@ def outreach(
         "skill's output contract exactly and end with the JSON block.\n"
         + json.dumps(lead_payload, indent=2)
     )
-    data = run_skill(task, "outreach")  # no tools: drafting only
+    data, prose = run_skill(task, "outreach", return_prose=True)  # no tools: drafting only
     drafts = data.get("drafts") if isinstance(data, dict) else None
     if not isinstance(drafts, list):
         raise typer.BadParameter("outreach result JSON had no 'drafts' array")
@@ -149,6 +153,7 @@ def outreach(
     out_dir.mkdir(parents=True, exist_ok=True)
     by_company = {r.get("Company", "").strip().lower(): r for r in eligible}
     written: list[tuple[str, Path]] = []
+    drafted_keys: set[str] = set()
     for draft in drafts:
         company = (draft.get("company") or "").strip()
         row = by_company.get(company.lower())
@@ -158,9 +163,24 @@ def outreach(
         path = out_dir / f"{pipeline.slugify(company)}.md"
         path.write_text(_render_draft(company, row.get("Email", ""), draft))
         written.append((company, path))
+        drafted_keys.add(row.get("Company", "").strip().lower())
 
     _preview_outreach(written)
     console.print(f"\nWrote {len(written)} outreach file(s) under {out_dir}.")
+
+    # Fail loudly (AGENTS.md §5): eligible leads went in but some/all came back with no
+    # draft. Surface the model's own explanation, name the companies, and exit nonzero.
+    # Any drafts that DID come back are already written above.
+    missing = [
+        r.get("Company", "")
+        for r in eligible
+        if r.get("Company", "").strip().lower() not in drafted_keys
+    ]
+    if missing:
+        if prose.strip():
+            err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
+        _warn("No outreach draft returned for: " + ", ".join(missing))
+        raise typer.Exit(code=1)
 
 
 @app.command("propose")

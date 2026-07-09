@@ -75,6 +75,11 @@ def extract_last_json_block(text: str) -> dict:
         raise ValueError(f"last ```json block was not valid JSON: {exc}") from exc
 
 
+def strip_json_blocks(text: str) -> str:
+    """Return the result's prose: text with every fenced ```json block removed."""
+    return _JSON_BLOCK.sub("", text).strip()
+
+
 def run_skill(
     task_prompt: str,
     skill_name: str,
@@ -82,11 +87,14 @@ def run_skill(
     allowed_tools: list[str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     extract_json: bool = True,
-) -> dict | str:
+    return_prose: bool = False,
+) -> dict | str | tuple[dict, str]:
     """Run `claude -p <task> --append-system-prompt-file <skill> --output-format json`.
 
     Returns the parsed last ```json block when extract_json is True (research/outreach),
-    otherwise the raw `result` text (propose). Raises RunnerError on any failure.
+    otherwise the raw `result` text (propose). With return_prose (outreach), returns a
+    (parsed_block, prose) tuple so the caller can surface the model's explanation when the
+    block is empty. Raises RunnerError on any failure.
     """
     skill_body = _load_skill_body(skill_name)
 
@@ -144,6 +152,10 @@ def run_skill(
         return result_text
 
     try:
-        return extract_last_json_block(result_text)
+        block = extract_last_json_block(result_text)
     except ValueError as exc:
         raise RunnerError(f"{exc} (skill={skill_name}) | raw: {raw_path}") from exc
+
+    if return_prose:
+        return block, strip_json_blocks(result_text)
+    return block
