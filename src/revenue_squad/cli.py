@@ -11,8 +11,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import crm, pipeline
+from . import pipeline, places
+from .backend import CrmChoice, get_backend
 from .blocklist import Blocklist
+from .notion import NotionBackend
 from .runner import run_skill
 
 app = typer.Typer(
@@ -37,14 +39,25 @@ def research(
     service_line: Optional[str] = typer.Option(
         None, "--service-line", help="Service line you're pitching (stored on each lead)."
     ),
+    crm_backend: CrmChoice = typer.Option(
+        CrmChoice.csv, "--crm", help="CRM backend to append leads to: csv (default) or notion."
+    ),
+    seed: Optional[places.SeedSource] = typer.Option(
+        None, "--seed", help="Optional lead seed source (places) — needs GOOGLE_MAPS_API_KEY."
+    ),
 ) -> None:
     """Research prospects, verify emails, and append survivors to the pipeline."""
+    backend = get_backend(crm_backend.value)
     blocklist = Blocklist.load()
     task = (
         f"Research {count} prospective B2B clients in {location} for the '{vertical}' vertical"
         + (f", to pitch our '{service_line}' service line" if service_line else "")
         + ". Follow the research skill's output contract exactly and end with the JSON block."
     )
+    if seed == places.SeedSource.places:
+        task += "\n\n" + places.format_candidates(
+            places.search_places(vertical, location, count)
+        )
     data = run_skill(task, "research", allowed_tools=["WebSearch", "WebFetch"])
     leads = data.get("leads") if isinstance(data, dict) else None
     if not isinstance(leads, list):
@@ -60,14 +73,14 @@ def research(
         blocklist=blocklist,
         report=_warn,
     )
-    added = crm.append(rows)
+    added = backend.append(rows)
     json_path, md_path = pipeline.write_research_outputs(
         rows, vertical_slug=vertical_slug, date_str=date_str
     )
 
     _preview_research(rows)
     console.print(
-        f"\nAppended [bold]{len(added)}[/bold] new lead(s) to {crm.DEFAULT_PATH} "
+        f"\nAppended [bold]{len(added)}[/bold] new lead(s) to {backend.describe()} "
         f"({len(rows) - len(added)} duplicate(s) skipped)."
     )
     console.print(f"Wrote {json_path} and {md_path}.")
@@ -78,12 +91,16 @@ def outreach(
     companies: Optional[List[str]] = typer.Argument(
         None, help="Companies to draft for. Default: all eligible Status=New rows."
     ),
+    crm_backend: CrmChoice = typer.Option(
+        CrmChoice.csv, "--crm", help="CRM backend to read leads from: csv (default) or notion."
+    ),
 ) -> None:
     """Draft Day 1/3/7 cold outreach for eligible leads. Never changes Status."""
+    backend = get_backend(crm_backend.value)
     blocklist = Blocklist.load()
-    rows = crm.load()
+    rows = backend.load()
     if not rows:
-        raise typer.BadParameter(f"{crm.DEFAULT_PATH} is empty — run `squad research` first.")
+        raise typer.BadParameter(f"{backend.describe()} is empty — run `squad research` first.")
 
     if companies:
         wanted = {c.strip().lower() for c in companies}
@@ -171,14 +188,33 @@ def propose(
 def mark_sent(
     company: str = typer.Argument(..., help="Company whose send you're recording."),
     day: int = typer.Option(1, "--day", help="Which touch was sent: 1, 3, or 7."),
+    crm_backend: CrmChoice = typer.Option(
+        CrmChoice.csv, "--crm", help="CRM backend to update: csv (default) or notion."
+    ),
 ) -> None:
     """Record that a Day 1/3/7 email went out. Day 1 also moves Status New->Contacted."""
     if day not in (1, 3, 7):
         raise typer.BadParameter("--day must be 1, 3, or 7")
-    row = crm.mark_sent(company, day=day)
+    row = get_backend(crm_backend.value).mark_sent(company, day=day)
     console.print(
         f"Marked Day {day} sent for [bold]{row.get('Company', '')}[/bold] "
         f"(Status={row.get('Status', '')})."
+    )
+
+
+@app.command("notion-init")
+def notion_init(
+    parent_page_id: str = typer.Option(
+        ..., "--parent-page-id", help="Notion page id to create the CRM database under."
+    ),
+) -> None:
+    """Create a Notion CRM database matching the pipeline schema; print its data source id."""
+    result = NotionBackend.create_database(parent_page_id)
+    console.print(f"Created database [bold]{result['database_id']}[/bold].")
+    console.print(f"Data source id: [bold]{result['data_source_id']}[/bold]")
+    console.print(
+        "\nExport this to use `--crm notion`:\n"
+        f"  export NOTION_DATA_SOURCE_ID={result['data_source_id']}"
     )
 
 
