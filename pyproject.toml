@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "revenue-squad"
 version = "0.1.0"
 description = "Solo-operator outbound B2B workflow (research -> outreach -> proposal) driven by the Claude CLI, with a verified-emails-only local CSV pipeline."
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "naidx0" }]

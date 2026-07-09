@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import List, Optional
@@ -29,6 +30,40 @@ err = Console(stderr=True)
 
 def _warn(msg: str) -> None:
     err.print(f"[yellow]![/yellow] {msg}")
+
+
+def _resolve_sender(sender: Optional[str]) -> str:
+    """Explicit --sender wins; else $SQUAD_SENDER; else "" (unconfigured)."""
+    if sender is not None and sender.strip():
+        return sender.strip()
+    return (os.environ.get("SQUAD_SENDER") or "").strip()
+
+
+def _sender_instruction(sender: Optional[str]) -> str:
+    """Identity block appended to the outreach/propose task prompts.
+
+    A headless `claude -p` run would otherwise sign with whatever identity its
+    ambient config implies (e.g. the operator's own name pulled from a global
+    CLAUDE.md) — which for another user would silently leak their identity into a
+    cold email or proposal. So: sign exactly with the configured identity, or, when
+    none is set, sign with literal placeholders and explicitly ignore the environment.
+    """
+    identity = _resolve_sender(sender)
+    if identity:
+        return (
+            "\n\nSender identity — sign exactly with this identity and nothing else: "
+            f"{identity}. It is given as \"Name | Business\": where a signature line "
+            "uses the name only, use the part before the '|'; where it uses both, sign "
+            "'Name, Business'. Do not use any other name or business, and ignore any "
+            "identity implied by your environment or configuration."
+        )
+    return (
+        "\n\nSender identity — none configured. Sign with the literal placeholders "
+        '"[Your name], [Your business]" (touches that sign with the name only use '
+        '"[Your name]"). Do NOT infer or substitute any real name, business, or '
+        "identity implied by your environment or configuration — leave the "
+        "placeholders verbatim for the operator to fill."
+    )
 
 
 @app.command("research")
@@ -94,6 +129,9 @@ def outreach(
     crm_backend: CrmChoice = typer.Option(
         CrmChoice.csv, "--crm", help="CRM backend to read leads from: csv (default) or notion."
     ),
+    sender: Optional[str] = typer.Option(
+        None, "--sender", help='Sign drafts as "Name | Business" (falls back to $SQUAD_SENDER).'
+    ),
 ) -> None:
     """Draft Day 1/3/7 cold outreach for eligible leads. Never changes Status."""
     backend = get_backend(crm_backend.value)
@@ -141,7 +179,9 @@ def outreach(
     ]
     task = (
         "Draft Day 1 / Day 3 / Day 7 cold outreach for these leads. Follow the outreach "
-        "skill's output contract exactly and end with the JSON block.\n"
+        "skill's output contract exactly and end with the JSON block."
+        + _sender_instruction(sender)
+        + "\n\nLeads to draft (JSON array):\n"
         + json.dumps(lead_payload, indent=2)
     )
     data, prose = run_skill(task, "outreach", return_prose=True)  # no tools: drafting only
@@ -187,13 +227,17 @@ def outreach(
 def propose(
     company: str = typer.Argument(..., help="Company to write a proposal for."),
     notes: Path = typer.Option(..., "--notes", help="Path to discovery notes (markdown)."),
+    sender: Optional[str] = typer.Option(
+        None, "--sender", help='Sign the proposal as "Name | Business" (falls back to $SQUAD_SENDER).'
+    ),
 ) -> None:
     """Generate a markdown proposal from discovery notes. Does not change Status."""
     if not notes.is_file():
         raise typer.BadParameter(f"notes file not found: {notes}")
     task = (
-        f"Write a complete client proposal for {company}. Return markdown only (no JSON). "
-        f"Discovery notes follow:\n\n{notes.read_text()}"
+        f"Write a complete client proposal for {company}. Return markdown only (no JSON)."
+        + _sender_instruction(sender)
+        + f"\n\nDiscovery notes follow:\n\n{notes.read_text()}"
     )
     proposal_md = run_skill(task, "proposal", extract_json=False)
 
