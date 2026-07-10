@@ -120,6 +120,31 @@ def test_research_chunk_failure_continues_and_exits_nonzero(tmp_path, monkeypatc
     assert [r["Company"] for r in rows] == ["Solo"]
 
 
+def test_research_chunk_with_malformed_lead_continues_and_exits_nonzero(tmp_path, monkeypatch):
+    """A lead missing 'company' fails contract validation (ValueError in _normalize_lead).
+    That must be treated like a chunk RunnerError — reported loudly, chunk dropped,
+    remaining chunks still run and append their valid leads, overall exit nonzero."""
+    monkeypatch.chdir(tmp_path)
+    # First chunk contains a lead with no 'company' -> ValueError; second chunk is clean.
+    per_call = [{"leads": [{"company": "GoodCo"}, {"website": "https://x.test"}]},
+                _leads("Solo")]
+    state = {"n": 0}
+
+    def fake(task, skill, **kw):
+        out = per_call[state["n"]]
+        state["n"] += 1
+        return out
+
+    monkeypatch.setattr(cli, "run_skill", fake)
+    result = CliRunner().invoke(cli.app, ["research", "Austin", "dentists", "-n", "11"])
+    assert result.exit_code == 1
+    flat = _flat(result.output)
+    assert "research chunk 1/2 failed" in flat
+    assert "chunk(s) failed: 1" in flat
+    # The bad chunk is dropped whole (GoodCo too); the surviving chunk still appends.
+    assert [r["Company"] for r in crm.load()] == ["Solo"]
+
+
 def test_research_aggregate_counts_blocklist_drop(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "blocklist.txt").write_text("blocked.test\n")

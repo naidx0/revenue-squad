@@ -318,6 +318,34 @@ def test_sync_bounces_saves_unparseable_raw(tmp_path, monkeypatch):
     assert result.unparseable[0].parent == (tmp_path / "out" / "raw").resolve()
 
 
+def test_sync_bounces_corrupt_dsn_is_unparseable_not_a_crash(tmp_path, monkeypatch):
+    """A message/delivery-status part with an invalid base64url body must not abort the
+    batch: it is saved to out/raw/ like any unparseable message, later well-formed
+    messages are still processed, and the command still exits nonzero (via unparseable)."""
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    corrupt = {"mimeType": "message/delivery-status", "body": {"data": "!!not base64!!"}}
+    good = "Final-Recipient: rfc822;a@x.test\nAction: failed\nStatus: 5.1.1\n"
+    messages = {
+        "m1": _message(parts=[corrupt]),          # would raise binascii.Error pre-fix
+        "m2": _message(parts=[_dsn_part(good)]),  # must still be processed after m1
+    }
+
+    def handler(request):
+        if str(request.url).startswith(gmail.TOKEN_URL):
+            return httpx.Response(200, json={"access_token": "at"})
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return httpx.Response(200, json={"messages": [{"id": "m1"}, {"id": "m2"}]})
+        mid = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=messages[mid])
+
+    result = gmail.sync_bounces(client=_client(handler))
+    assert [b.recipient for b in result.bounces] == ["a@x.test"]  # m2 survived
+    assert result.scanned == 2
+    assert len(result.unparseable) == 1                            # m1 saved to raw
+    assert result.unparseable[0].parent == (tmp_path / "out" / "raw").resolve()
+
+
 def test_sync_bounces_no_token_raises_naming_auth(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(gmail.GmailError, match="gmail-auth"):

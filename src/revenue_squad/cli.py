@@ -181,14 +181,22 @@ def _run_research(
         if not isinstance(leads, list):
             raise typer.BadParameter("research result JSON had no 'leads' array")
         outcome.returned += len(leads)
-        rows = pipeline.process_research_leads(
-            leads,
-            vertical=vertical,
-            service_line=service_line,
-            batch=batch,
-            blocklist=blocklist,
-            report=reporter,
-        )
+        try:
+            rows = pipeline.process_research_leads(
+                leads,
+                vertical=vertical,
+                service_line=service_line,
+                batch=batch,
+                blocklist=blocklist,
+                report=reporter,
+            )
+        except ValueError as exc:
+            # A malformed lead (e.g. missing 'company') fails contract validation. Treat it
+            # exactly like a chunk RunnerError: report loudly, drop this chunk, keep going —
+            # never let it crash the whole multi-chunk run.
+            outcome.failed_chunks.append(idx)
+            _warn(f"research chunk {idx}/{n_chunks} failed (continuing): {exc}")
+            continue
         outcome.rows_produced += len(rows)
         added = backend.append(rows)
         outcome.appended += len(added)

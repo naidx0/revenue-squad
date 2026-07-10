@@ -235,6 +235,39 @@ def test_mark_sent_day3_clears_follow_up_due():
     assert patched["body"]["follow_up_due"] is None  # cleared date -> null
 
 
+def test_mark_sent_escapes_like_wildcards_so_underscore_is_literal():
+    """`A_B Co` must match only itself, not `AXB Co`: the `_` LIKE wildcard is escaped,
+    and the backend responds with the single literal row (as a real DB would)."""
+    seen = {}
+
+    def handler(request):
+        if request.method == "GET":
+            params = _params(request)
+            seen["company"] = params["company"][0]
+            # A correctly-escaped literal filter returns only the exact row.
+            return httpx.Response(200, json=[_record("A_B Co", status="New")])
+        assert request.method == "PATCH"
+        seen["patched_id"] = _params(request)["id"][0]
+        return httpx.Response(200, json=[{}])
+
+    row = _backend(handler).mark_sent("A_B Co", day=1)
+    assert seen["company"] == "ilike.A\\_B Co"  # underscore escaped, so no fan-out
+    assert row["Company"] == "A_B Co"
+    assert seen["patched_id"] == f"eq.{_record('A_B Co')['id']}"
+
+
+def test_mark_sent_ambiguous_multi_match_raises_loudly():
+    """If more than one row matches (defense-in-depth), refuse rather than silently
+    updating records[0]."""
+    def handler(request):
+        assert request.method == "GET"  # never reaches PATCH
+        return httpx.Response(200, json=[_record("Acme", status="New"),
+                                         _record("Acme Inc", status="New")])
+
+    with pytest.raises(SupabaseError, match="ambiguous company match"):
+        _backend(handler).mark_sent("Acme", day=1)
+
+
 def test_mark_sent_missing_company_raises():
     def handler(request):
         return httpx.Response(200, json=[])

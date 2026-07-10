@@ -142,6 +142,16 @@ def _decode_row(record: dict) -> dict[str, str]:
     return row
 
 
+def _escape_like(value: str) -> str:
+    """Escape Postgres LIKE/ILIKE wildcards so a PostgREST ilike filter matches literally.
+
+    Without this a company name containing `_` or `%` (both LIKE wildcards) would match
+    unrelated rows — e.g. `A_B Co` would ilike-match `AXB Co`. Backslash is the default
+    LIKE escape char, so it is escaped first to avoid double-escaping the escapes we add.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _dedupe_key(row: dict[str, str]) -> tuple[str, str]:
     # Mirrors crm._key so the Supabase append dedupes exactly like the CSV/Notion paths.
     return (row.get("Company", "").strip().lower(), row.get("Email", "").strip().lower())
@@ -216,14 +226,21 @@ class SupabaseBackend:
         else:
             updates = {"Day 7 Sent": today, "Follow Up Due": ""}
 
-        # Case-insensitive company match via PostgREST ilike (no wildcard == exact, ci).
+        # Case-insensitive company match via PostgREST ilike. Wildcards in the name are
+        # escaped so the match is literal (no `_`/`%` fan-out onto other rows).
         resp = self._request(
-            "GET", params={"select": "*", "company": f"ilike.{company.strip()}"}
+            "GET",
+            params={"select": "*", "company": f"ilike.{_escape_like(company.strip())}"},
         )
         records = resp.json()
         if not records:
             raise ValueError(
                 f"no supabase row for company: {company!r} (table={self._base})"
+            )
+        if len(records) > 1:
+            raise SupabaseError(
+                f"ambiguous company match for {company!r}: {len(records)} rows matched "
+                f"(table={self._base}) — refusing to guess which to update."
             )
         record = records[0]
         row = _decode_row(record)

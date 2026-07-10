@@ -449,8 +449,15 @@ def extract_bounce(message: dict) -> Bounce | None:
     a domain-level failure. Never guesses — an unfound recipient returns None.
     """
     payload = message.get("payload", {}) or {}
-    dsn = _find_delivery_status(payload)
-    fields = _parse_dsn_fields(dsn) if dsn else {}
+    try:
+        dsn = _find_delivery_status(payload)
+        fields = _parse_dsn_fields(dsn) if dsn else {}
+    except Exception:
+        # A corrupt DSN part (e.g. an invalid-base64url body) makes the whole message
+        # unparseable — return None so the caller saves it to out/raw/, reports it, and
+        # continues, exactly like a message with no recognizable recipient. Never let a
+        # decode/parse error escape and abort the whole bounce-sync batch.
+        return None
 
     header_value = _first_header(payload, "X-Failed-Recipients")
     if header_value:
