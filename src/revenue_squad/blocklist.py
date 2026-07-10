@@ -7,6 +7,9 @@ One entry per line: a bare domain (example.com) or a full email (a@example.com).
 
 from __future__ import annotations
 
+import os
+import tempfile
+from datetime import date
 from pathlib import Path
 
 DEFAULT_PATH = Path("blocklist.txt")
@@ -49,3 +52,56 @@ class Blocklist:
             domain = value.split("@", 1)[1]
             return domain in self._domains
         return value in self._domains
+
+
+def _existing_entries(text: str) -> set[str]:
+    """Every entry already declared in the file, parsed exactly like Blocklist.load."""
+    out: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip().lower()
+        if line:
+            out.add(line)
+    return out
+
+
+def append_entries(entries: list[str], path: Path | str = DEFAULT_PATH) -> list[str]:
+    """Append new blocklist entries under a dated comment header; return what was written.
+
+    Preserves existing file content and comments verbatim. Dedupes case-insensitively
+    against existing entries and within the batch. Atomic (temp file + os.replace).
+    Returns the lowercased entries actually written, in order (empty if nothing new).
+    """
+    path = Path(path)
+    existing_text = path.read_text() if path.is_file() else ""
+    seen = _existing_entries(existing_text)
+    to_add: list[str] = []
+    for entry in entries:
+        norm = (entry or "").strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        to_add.append(norm)
+    if not to_add:
+        return []
+
+    block = (
+        f"# added by squad gmail-sync-bounces {date.today().isoformat()}\n"
+        + "\n".join(to_add)
+        + "\n"
+    )
+    if existing_text:
+        prefix = existing_text if existing_text.endswith("\n") else existing_text + "\n"
+        new_text = prefix + "\n" + block
+    else:
+        new_text = block
+
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".blocklist-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(new_text)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return to_add

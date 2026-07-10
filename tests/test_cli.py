@@ -6,6 +6,7 @@ import json
 from typer.testing import CliRunner
 
 from revenue_squad import cli, crm
+from revenue_squad.gmail import Bounce, BounceSyncResult
 
 
 def _lead(company, email="", **extra):
@@ -255,3 +256,61 @@ def test_propose_prompt_placeholder_when_no_sender(tmp_path, monkeypatch):
     task = _capture_propose_task(tmp_path, monkeypatch, [])
     assert "[Your name], [Your business]" in task
     assert "Do NOT infer or substitute" in task
+
+
+# --- gmail-sync-bounces: blocklist appends, exit codes, loud missing-token ---
+
+
+def test_gmail_sync_no_token_exits_nonzero_naming_auth(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no .gmail-token.json here -> real _load_token raises
+    result = CliRunner().invoke(cli.app, ["gmail-sync-bounces"])
+    assert result.exit_code == 1
+    assert "gmail-auth" in result.output
+
+
+def test_gmail_sync_unparseable_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    raw = tmp_path / "out" / "raw" / "gmail-bounce-x.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("{}")
+    monkeypatch.setattr(
+        cli.gmail, "sync_bounces",
+        lambda **kw: BounceSyncResult(bounces=[], unparseable=[raw], scanned=1),
+    )
+    result = CliRunner().invoke(cli.app, ["gmail-sync-bounces"])
+    assert result.exit_code == 1
+    assert "UNPARSEABLE" in result.output
+    # rich may word-wrap the long path; the basename confirms the path was reported.
+    assert "gmail-bounce-x.json" in result.output
+
+
+def test_gmail_sync_appends_and_reports(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def fake_sync(**kw):
+        return BounceSyncResult(
+            bounces=[
+                Bounce("jane@acme.test", False, "5.1.1"),
+                Bounce("bob@dead.test", True, "5.1.2 Domain not found"),
+            ],
+            unparseable=[],
+            scanned=2,
+        )
+
+    monkeypatch.setattr(cli.gmail, "sync_bounces", fake_sync)
+    result = CliRunner().invoke(cli.app, ["gmail-sync-bounces"])
+    assert result.exit_code == 0, result.output
+    lines = [l.strip() for l in (tmp_path / "blocklist.txt").read_text().splitlines()]
+    assert "jane@acme.test" in lines
+    assert "bob@dead.test" in lines
+    assert "dead.test" in lines  # domain-level entry appended for the domain failure
+    assert "jane@acme.test" in result.output
+
+
+def test_gmail_sync_no_bounces_says_so(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.gmail, "sync_bounces", lambda **kw: BounceSyncResult())
+    result = CliRunner().invoke(cli.app, ["gmail-sync-bounces"])
+    assert result.exit_code == 0
+    assert "No new bounces" in result.output
+    assert not (tmp_path / "blocklist.txt").exists()

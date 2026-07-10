@@ -12,9 +12,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import pipeline, places
+from . import gmail, pipeline, places
 from .backend import CrmChoice, get_backend
-from .blocklist import Blocklist
+from .blocklist import Blocklist, append_entries
 from .notion import NotionBackend
 from .runner import run_skill
 
@@ -313,6 +313,75 @@ def notion_init(
         "\nExport this to use `--crm notion`:\n"
         f"  export NOTION_DATA_SOURCE_ID={result['data_source_id']}"
     )
+
+
+@app.command("gmail-auth")
+def gmail_auth(
+    client_secret: Path = typer.Option(
+        ..., "--client-secret", help="Path to your Google Desktop-app OAuth client_secret.json."
+    ),
+) -> None:
+    """Authorize Gmail via OAuth (PKCE + loopback). Stores a refresh token at .gmail-token.json."""
+    try:
+        token_path = gmail.authorize(client_secret)
+    except gmail.GmailError as exc:
+        _warn(str(exc))
+        raise typer.Exit(code=1)
+    console.print(f"\nSaved Gmail token to [bold]{token_path}[/bold] (0600 perms).")
+    console.print(
+        "[yellow]7-day caveat:[/yellow] while your Google OAuth app is in 'Testing' publishing "
+        "status, this refresh token expires after 7 days. Re-run `squad gmail-auth` weekly."
+    )
+
+
+@app.command("gmail-sync-bounces")
+def gmail_sync_bounces() -> None:
+    """Scan Gmail for bounces and add failed recipients (and dead domains) to blocklist.txt.
+
+    Appends the exact failed email always, plus its domain when the diagnostic indicates a
+    domain-level failure. Dedupes against existing entries. Sends nothing.
+    """
+    try:
+        result = gmail.sync_bounces()
+    except gmail.GmailError as exc:
+        _warn(str(exc))
+        raise typer.Exit(code=1)
+
+    reasons: dict[str, str] = {}
+    ordered: list[str] = []
+    for bounce in result.bounces:
+        rcpt = bounce.recipient.strip().lower()
+        if rcpt and rcpt not in reasons:
+            reasons[rcpt] = f"bounced ({bounce.diagnostic})" if bounce.diagnostic else "bounced"
+            ordered.append(rcpt)
+        if bounce.domain_failure and "@" in rcpt:
+            domain = rcpt.split("@", 1)[1]
+            if domain and domain not in reasons:
+                reasons[domain] = (
+                    f"domain-level failure ({bounce.diagnostic})"
+                    if bounce.diagnostic
+                    else "domain-level failure"
+                )
+                ordered.append(domain)
+
+    added = append_entries(ordered)
+    if added:
+        console.print(f"Added [bold]{len(added)}[/bold] entr(ies) to blocklist.txt:")
+        for entry in added:
+            console.print(f"  + {entry}  — {reasons.get(entry, '')}", markup=False)
+    elif result.bounces:
+        console.print("Bounces found, but every failed recipient/domain was already blocklisted.")
+    else:
+        console.print("No new bounces.")
+
+    if result.unparseable:
+        for path in result.unparseable:
+            _warn(f"UNPARSEABLE bounce saved to {path} — inspect it and blocklist manually.")
+        _warn(
+            f"{len(result.unparseable)} bounce message(s) could not be parsed. "
+            "Partial results applied above; exiting nonzero."
+        )
+        raise typer.Exit(code=1)
 
 
 def _preview_research(rows: list[dict[str, str]]) -> None:
