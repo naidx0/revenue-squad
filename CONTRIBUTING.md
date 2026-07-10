@@ -16,10 +16,20 @@ class CrmBackend(Protocol):
     def describe(self) -> str: ...
 ```
 
-`CsvBackend` and `NotionBackend` implement it. To add one (Airtable, a Google Sheet,
-a Postgres table, …): implement the four methods, use `crm.COLUMNS` as the schema of
-record, dedupe by `(Company, Email)` exactly as the existing backends do, add a value
-to the `CrmChoice` enum, and wire it into `get_backend`.
+`CsvBackend`, `NotionBackend`, and `SupabaseBackend` implement it. To add one (Airtable,
+a Google Sheet, a Postgres table, …): implement the four methods, use `crm.COLUMNS` as
+the schema of record, dedupe by `(Company, Email)` exactly as the existing backends do,
+add a value to the `CrmChoice` enum, and wire it into `get_backend`.
+
+There are now **two real remote adapters to copy from** if you're building a third:
+`notion.py` (Notion's REST API) and `supabase.py` (Supabase over straight PostgREST) —
+both are the same shape (typed error class, injectable `httpx` client, a single column
+mapping checked against `crm.COLUMNS` at import, non-2xx raises with a body tail), so
+diffing them shows exactly which parts are backend-specific. If your integration is
+OAuth-based, follow `gmail.py`: keep tokens out of git (`.gmail-token.json` and
+`client_secret*.json` are already gitignored), write them `0600`, and **fail loudly on
+expiry** — surface the re-auth command rather than silently degrading (Gmail's
+`invalid_grant` path is the worked example).
 
 ## New lead-seed sources
 
