@@ -1,0 +1,9 @@
+# squad.toml — optional config for `squad daily`.
+# Copy to `squad.toml` (gitignored by default is your call) and edit.
+# Command-line flags always override these values.
+
+[daily]
+location = "Austin, TX"       # required (or pass --location)
+vertical = "dental clinics"   # required (or pass --vertical)
+count = 10                     # optional, default 10 (or pass -n/--count)
+service_line = "SEO"          # optional (or pass --service-line)

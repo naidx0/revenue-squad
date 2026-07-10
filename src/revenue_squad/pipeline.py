@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -207,3 +207,61 @@ def outreach_eligibility(
     if site_domain and blocklist.is_blocked(site_domain):
         return (False, f"domain {site_domain} is blocklisted")
     return (True, "")
+
+
+def _parse_iso_date(value: str) -> date | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _followup_open(row: dict[str, str]) -> bool:
+    """A row is in the follow-up window only while it's an un-replied, un-blocked Contacted lead.
+
+    Status==Contacted already excludes Replied/Lost/etc.; the Replied and Blocked column
+    guards catch a lead flagged mid-sequence without a status change.
+    """
+    if (row.get("Status") or "").strip() != "Contacted":
+        return False
+    if (row.get("Replied") or "").strip():
+        return False
+    if (row.get("Blocked") or "").strip():
+        return False
+    return True
+
+
+def followups_due(
+    rows: list[dict[str, str]], today: date
+) -> list[tuple[str, str, str]]:
+    """Return (company, touch, due-since-date) for every follow-up that is due as of `today`.
+
+    Pure over the pipeline dates:
+      - Day 3 is due when Day 1 Sent <= today-2d, no Day 3 Sent yet.
+      - Day 7 is due when Day 1 Sent <= today-6d, Day 3 Sent present, no Day 7 Sent yet.
+    Both require an open (Contacted, not Replied/Blocked) row. A missing/unparseable
+    Day 1 Sent means nothing is due. The due-since date is when the touch became due
+    (Day 1 Sent + 2d for Day 3, + 6d for Day 7).
+    """
+    due: list[tuple[str, str, str]] = []
+    for row in rows:
+        if not _followup_open(row):
+            continue
+        d1 = _parse_iso_date(row.get("Day 1 Sent", ""))
+        if d1 is None:
+            continue
+        company = (row.get("Company") or "").strip()
+        has_d3 = bool((row.get("Day 3 Sent") or "").strip())
+        has_d7 = bool((row.get("Day 7 Sent") or "").strip())
+        if not has_d3:
+            since = d1 + timedelta(days=2)
+            if today >= since:
+                due.append((company, "Day 3", since.isoformat()))
+        elif not has_d7:
+            since = d1 + timedelta(days=6)
+            if today >= since:
+                due.append((company, "Day 7", since.isoformat()))
+    return due

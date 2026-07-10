@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import List, Optional
@@ -16,7 +18,14 @@ from . import gmail, pipeline, places, supabase
 from .backend import CrmChoice, get_backend
 from .blocklist import Blocklist, append_entries
 from .notion import NotionBackend
-from .runner import run_skill
+from .runner import RunnerError, run_skill
+
+# Chunk sizes for the batched claude runs — past these, one `claude -p` per command
+# blows the context/timeout budget and quality collapses.
+RESEARCH_CHUNK = 10
+OUTREACH_CHUNK = 8
+DAILY_CONFIG_PATH = Path("squad.toml")
+DAILY_DEFAULT_COUNT = 10
 
 app = typer.Typer(
     help="Solo-operator outbound B2B workflow driven by the Claude CLI.",
@@ -66,6 +75,136 @@ def _sender_instruction(sender: Optional[str]) -> str:
     )
 
 
+def _split_count(total: int, size: int) -> list[int]:
+    """Split `total` into chunk sizes of at most `size` (e.g. 11,10 -> [10, 1]; 10,10 -> [10])."""
+    if total <= 0:
+        return []
+    sizes: list[int] = []
+    remaining = total
+    while remaining > 0:
+        take = min(size, remaining)
+        sizes.append(take)
+        remaining -= take
+    return sizes
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    """Split a list into consecutive groups of at most `size`."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+class _ResearchReporter:
+    """Wrap the loud _warn reporter and tally blocklist drops / MX demotions for the aggregate."""
+
+    def __init__(self, report) -> None:
+        self._report = report
+        self.dropped_blocklist = 0
+        self.demoted_mx = 0
+
+    def __call__(self, msg: str) -> None:
+        self._report(msg)
+        if msg.startswith("DROP "):
+            self.dropped_blocklist += 1
+        elif msg.startswith("DEMOTE ") and "(MX:" in msg:
+            self.demoted_mx += 1
+
+
+@dataclass
+class ResearchOutcome:
+    requested: int = 0
+    returned: int = 0
+    rows_produced: int = 0
+    appended: int = 0
+    dropped_blocklist: int = 0
+    demoted_mx: int = 0
+    failed_chunks: list[int] = field(default_factory=list)
+    n_chunks: int = 0
+    all_rows: list[dict[str, str]] = field(default_factory=list)
+    json_path: Optional[Path] = None
+    md_path: Optional[Path] = None
+
+
+def _run_research(
+    location: str,
+    vertical: str,
+    count: int,
+    service_line: Optional[str],
+    *,
+    backend,
+    blocklist: Blocklist,
+    seed: Optional[places.SeedSource],
+) -> ResearchOutcome:
+    """Research `count` prospects in ceil(count/RESEARCH_CHUNK) sequential claude runs.
+
+    Cross-chunk repeats are absorbed by the existing (Company, Email) dedupe in
+    backend.append (each chunk sees the prior chunk's rows). A chunk RunnerError is
+    reported loudly and recorded, the remaining chunks still run, and the caller
+    exits nonzero naming the failed chunks. Single-chunk runs produce byte-identical
+    output to the pre-chunking path.
+    """
+    sizes = _split_count(count, RESEARCH_CHUNK)
+    n_chunks = len(sizes)
+    outcome = ResearchOutcome(requested=count, n_chunks=n_chunks)
+    reporter = _ResearchReporter(_warn)
+
+    candidates = (
+        places.search_places(vertical, location, count)
+        if seed == places.SeedSource.places
+        else []
+    )
+    date_str = date.today().isoformat()
+    vertical_slug = pipeline.slugify(vertical)
+    batch = f"{vertical_slug}-{date_str}"
+
+    offset = 0
+    for idx, size in enumerate(sizes, 1):
+        if n_chunks > 1:
+            console.print(f"[research {idx}/{n_chunks}] researching {size} prospect(s)…")
+        task = (
+            f"Research {size} prospective B2B clients in {location} for the '{vertical}' vertical"
+            + (f", to pitch our '{service_line}' service line" if service_line else "")
+            + ". Follow the research skill's output contract exactly and end with the JSON block."
+        )
+        chunk_candidates = candidates[offset : offset + size]
+        offset += size
+        if seed == places.SeedSource.places:
+            task += "\n\n" + places.format_candidates(chunk_candidates)
+
+        try:
+            data = run_skill(task, "research", allowed_tools=["WebSearch", "WebFetch"])
+        except RunnerError as exc:
+            outcome.failed_chunks.append(idx)
+            _warn(f"research chunk {idx}/{n_chunks} failed (continuing): {exc}")
+            continue
+
+        leads = data.get("leads") if isinstance(data, dict) else None
+        if not isinstance(leads, list):
+            raise typer.BadParameter("research result JSON had no 'leads' array")
+        outcome.returned += len(leads)
+        rows = pipeline.process_research_leads(
+            leads,
+            vertical=vertical,
+            service_line=service_line,
+            batch=batch,
+            blocklist=blocklist,
+            report=reporter,
+        )
+        outcome.rows_produced += len(rows)
+        added = backend.append(rows)
+        outcome.appended += len(added)
+        outcome.all_rows.extend(rows)
+
+    outcome.dropped_blocklist = reporter.dropped_blocklist
+    outcome.demoted_mx = reporter.demoted_mx
+    # Write the aggregated research outputs once. Skip only when every chunk failed and
+    # nothing came back — don't fabricate an empty summary over a fully-failed run.
+    if outcome.all_rows or not outcome.failed_chunks:
+        outcome.json_path, outcome.md_path = pipeline.write_research_outputs(
+            outcome.all_rows, vertical_slug=vertical_slug, date_str=date_str
+        )
+    return outcome
+
+
 @app.command("research")
 def research(
     location: str = typer.Argument(..., help="City / area to prospect in."),
@@ -85,41 +224,32 @@ def research(
     """Research prospects, verify emails, and append survivors to the pipeline."""
     backend = get_backend(crm_backend.value)
     blocklist = Blocklist.load()
-    task = (
-        f"Research {count} prospective B2B clients in {location} for the '{vertical}' vertical"
-        + (f", to pitch our '{service_line}' service line" if service_line else "")
-        + ". Follow the research skill's output contract exactly and end with the JSON block."
-    )
-    if seed == places.SeedSource.places:
-        task += "\n\n" + places.format_candidates(
-            places.search_places(vertical, location, count)
-        )
-    data = run_skill(task, "research", allowed_tools=["WebSearch", "WebFetch"])
-    leads = data.get("leads") if isinstance(data, dict) else None
-    if not isinstance(leads, list):
-        raise typer.BadParameter("research result JSON had no 'leads' array")
-
-    date_str = date.today().isoformat()
-    vertical_slug = pipeline.slugify(vertical)
-    rows = pipeline.process_research_leads(
-        leads,
-        vertical=vertical,
-        service_line=service_line,
-        batch=f"{vertical_slug}-{date_str}",
-        blocklist=blocklist,
-        report=_warn,
-    )
-    added = backend.append(rows)
-    json_path, md_path = pipeline.write_research_outputs(
-        rows, vertical_slug=vertical_slug, date_str=date_str
+    outcome = _run_research(
+        location, vertical, count, service_line,
+        backend=backend, blocklist=blocklist, seed=seed,
     )
 
-    _preview_research(rows)
+    _preview_research(outcome.all_rows)
     console.print(
-        f"\nAppended [bold]{len(added)}[/bold] new lead(s) to {backend.describe()} "
-        f"({len(rows) - len(added)} duplicate(s) skipped)."
+        f"\nAppended [bold]{outcome.appended}[/bold] new lead(s) to {backend.describe()} "
+        f"({outcome.rows_produced - outcome.appended} duplicate(s) skipped)."
     )
-    console.print(f"Wrote {json_path} and {md_path}.")
+    if outcome.json_path is not None:
+        console.print(f"Wrote {outcome.json_path} and {outcome.md_path}.")
+    if outcome.n_chunks > 1:
+        console.print(
+            f"Chunked research across {outcome.n_chunks} runs — requested {outcome.requested}, "
+            f"returned {outcome.returned}, deduped {outcome.rows_produced - outcome.appended}, "
+            f"dropped-blocklist {outcome.dropped_blocklist}, demoted-MX {outcome.demoted_mx}, "
+            f"appended {outcome.appended}."
+        )
+    if outcome.failed_chunks:
+        _warn(
+            "research chunk(s) failed: "
+            + ", ".join(str(i) for i in outcome.failed_chunks)
+            + " — raw output saved under out/raw/. Partial results applied above; exiting nonzero."
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("outreach")
@@ -156,13 +286,7 @@ def outreach(
     else:
         targets = [r for r in rows if r.get("Status") == "New"]
 
-    eligible: list[dict[str, str]] = []
-    for row in targets:
-        ok, reason = pipeline.outreach_eligibility(row, blocklist)
-        if ok:
-            eligible.append(row)
-        else:
-            _warn(f"REFUSE {row.get('Company', '')}: {reason}")
+    eligible = _filter_eligible(targets, blocklist)
 
     prose = ""
     drafted_keys: set[str] = set()
@@ -175,9 +299,10 @@ def outreach(
         if not explicit:
             raise typer.Exit(code=0)
     else:
-        prose, drafted_keys, gmail_failed = _draft_eligible(
-            eligible, sender, gmail_drafts=gmail_drafts
-        )
+        outcome = _draft_eligible(eligible, sender, gmail_drafts=gmail_drafts)
+        prose = outcome.prose
+        drafted_keys = outcome.drafted_keys
+        gmail_failed = outcome.gmail_failed
 
     if explicit:
         # Every named company must have produced a written draft; anything missing
@@ -216,65 +341,110 @@ def outreach(
         raise typer.Exit(code=1)
 
 
+def _filter_eligible(
+    targets: list[dict[str, str]], blocklist: Blocklist
+) -> list[dict[str, str]]:
+    """Return the outreach-eligible rows, warning REFUSE with a reason for each ineligible one."""
+    eligible: list[dict[str, str]] = []
+    for row in targets:
+        ok, reason = pipeline.outreach_eligibility(row, blocklist)
+        if ok:
+            eligible.append(row)
+        else:
+            _warn(f"REFUSE {row.get('Company', '')}: {reason}")
+    return eligible
+
+
+@dataclass
+class DraftOutcome:
+    prose: str = ""
+    drafted_keys: set[str] = field(default_factory=set)
+    gmail_failed: bool = False
+    written: list[tuple[str, Path]] = field(default_factory=list)
+    failed_chunks: list[int] = field(default_factory=list)
+    n_chunks: int = 0
+
+
 def _draft_eligible(
     eligible: list[dict[str, str]], sender: Optional[str], *, gmail_drafts: bool = False
-) -> tuple[str, set[str], bool]:
-    """Run the outreach skill for eligible leads, write each returned draft, and return
-    (model prose, set of drafted Company keys, gmail_failed). Any draft that comes back is
-    written to disk; with gmail_drafts, each is also pushed to Gmail as a Day 1 draft."""
-    lead_payload = [
-        {
-            "company": r.get("Company", ""),
-            "contact": r.get("Contact", ""),
-            "email": r.get("Email", ""),
-            "email_evidence": r.get("Email Evidence", ""),
-            "website": r.get("Website", ""),
-            "city": r.get("City", ""),
-            "vertical": r.get("Vertical", ""),
-            "service_line": r.get("Service Line", ""),
-            "lead_score": r.get("Lead Score", ""),
-            "score_rationale": r.get("Score Rationale", ""),
-            "notes": r.get("Notes", ""),
-        }
-        for r in eligible
-    ]
-    task = (
-        "Draft Day 1 / Day 3 / Day 7 cold outreach for these leads. Follow the outreach "
-        "skill's output contract exactly and end with the JSON block."
-        + _sender_instruction(sender)
-        + "\n\nLeads to draft (JSON array):\n"
-        + json.dumps(lead_payload, indent=2)
-    )
-    data, prose = run_skill(task, "outreach", return_prose=True)  # no tools: drafting only
-    drafts = data.get("drafts") if isinstance(data, dict) else None
-    if not isinstance(drafts, list):
-        raise typer.BadParameter("outreach result JSON had no 'drafts' array")
-
+) -> DraftOutcome:
+    """Run the outreach skill for eligible leads in groups of at most OUTREACH_CHUNK, writing
+    each returned draft to disk. A chunk RunnerError is reported loudly and recorded; its
+    leads simply never enter drafted_keys, so the caller's existing fulfilled/unfulfilled
+    machinery flags them and exits nonzero. Single-chunk runs are byte-identical to the
+    pre-chunking path. With gmail_drafts, every written draft is also pushed to Gmail (once,
+    after all chunks) as a Day 1 draft."""
+    groups = _chunk(eligible, OUTREACH_CHUNK)
+    n_chunks = len(groups)
+    outcome = DraftOutcome(n_chunks=n_chunks)
     out_dir = Path("out") / "outreach"
     out_dir.mkdir(parents=True, exist_ok=True)
-    by_company = {r.get("Company", "").strip().lower(): r for r in eligible}
-    written: list[tuple[str, Path]] = []
-    drafted_keys: set[str] = set()
+    proses: list[str] = []
     for_gmail: list[tuple[str, dict[str, str], dict]] = []  # (company, row, draft)
-    for draft in drafts:
-        company = (draft.get("company") or "").strip()
-        row = by_company.get(company.lower())
-        if row is None:
-            _warn(f"SKIP draft for {company!r}: no matching eligible lead")
+
+    for idx, group in enumerate(groups, 1):
+        if n_chunks > 1:
+            console.print(f"[outreach {idx}/{n_chunks}] drafting {len(group)} lead(s)…")
+        lead_payload = [
+            {
+                "company": r.get("Company", ""),
+                "contact": r.get("Contact", ""),
+                "email": r.get("Email", ""),
+                "email_evidence": r.get("Email Evidence", ""),
+                "website": r.get("Website", ""),
+                "city": r.get("City", ""),
+                "vertical": r.get("Vertical", ""),
+                "service_line": r.get("Service Line", ""),
+                "lead_score": r.get("Lead Score", ""),
+                "score_rationale": r.get("Score Rationale", ""),
+                "notes": r.get("Notes", ""),
+            }
+            for r in group
+        ]
+        task = (
+            "Draft Day 1 / Day 3 / Day 7 cold outreach for these leads. Follow the outreach "
+            "skill's output contract exactly and end with the JSON block."
+            + _sender_instruction(sender)
+            + "\n\nLeads to draft (JSON array):\n"
+            + json.dumps(lead_payload, indent=2)
+        )
+        try:
+            data, prose = run_skill(task, "outreach", return_prose=True)  # no tools: drafting only
+        except RunnerError as exc:
+            outcome.failed_chunks.append(idx)
+            _warn(f"outreach chunk {idx}/{n_chunks} failed (continuing): {exc}")
             continue
-        path = out_dir / f"{pipeline.slugify(company)}.md"
-        path.write_text(_render_draft(company, row.get("Email", ""), draft))
-        written.append((company, path))
-        drafted_keys.add(row.get("Company", "").strip().lower())
-        for_gmail.append((company, row, draft))
+        if prose.strip():
+            proses.append(prose.strip())
+        drafts = data.get("drafts") if isinstance(data, dict) else None
+        if not isinstance(drafts, list):
+            raise typer.BadParameter("outreach result JSON had no 'drafts' array")
 
-    _preview_outreach(written)
-    console.print(f"\nWrote {len(written)} outreach file(s) under {out_dir}.")
+        by_company = {r.get("Company", "").strip().lower(): r for r in group}
+        for draft in drafts:
+            company = (draft.get("company") or "").strip()
+            row = by_company.get(company.lower())
+            if row is None:
+                _warn(f"SKIP draft for {company!r}: no matching eligible lead")
+                continue
+            path = out_dir / f"{pipeline.slugify(company)}.md"
+            path.write_text(_render_draft(company, row.get("Email", ""), draft))
+            outcome.written.append((company, path))
+            outcome.drafted_keys.add(row.get("Company", "").strip().lower())
+            for_gmail.append((company, row, draft))
 
-    gmail_failed = False
+    outcome.prose = "\n".join(proses)
+    _preview_outreach(outcome.written)
+    console.print(f"\nWrote {len(outcome.written)} outreach file(s) under {out_dir}.")
+
+    if outcome.n_chunks > 1:
+        console.print(
+            f"Chunked outreach across {outcome.n_chunks} runs — {len(eligible)} eligible, "
+            f"{len(outcome.written)} draft(s) written."
+        )
     if gmail_drafts and for_gmail:
-        gmail_failed = _create_gmail_drafts(for_gmail, sender)
-    return prose, drafted_keys, gmail_failed
+        outcome.gmail_failed = _create_gmail_drafts(for_gmail, sender)
+    return outcome
 
 
 def _create_gmail_drafts(
@@ -338,23 +508,96 @@ def propose(
     console.print(f"Wrote proposal for [bold]{company}[/bold] to {path}.")
 
 
+def _day_transition_eligible(row: dict[str, str], day: int) -> bool:
+    """True when `row` is in the right state for a Day-`day` send to be recorded.
+
+    Day 1: not yet sent. Day 3: Day 1 sent, Day 3 not. Day 7: Day 3 sent, Day 7 not.
+    """
+    d1 = (row.get("Day 1 Sent") or "").strip()
+    d3 = (row.get("Day 3 Sent") or "").strip()
+    d7 = (row.get("Day 7 Sent") or "").strip()
+    if day == 1:
+        return not d1
+    if day == 3:
+        return bool(d1) and not d3
+    return bool(d3) and not d7
+
+
+def _mark_one(backend, company: str, day: int) -> bool:
+    """Mark a single company's Day-`day` send. Returns True on success, False (loud) if absent."""
+    try:
+        row = backend.mark_sent(company, day=day)
+    except ValueError as exc:
+        _warn(f"NOT MARKED {company.strip()}: {exc}")
+        return False
+    console.print(
+        f"Marked Day {day} sent for [bold]{row.get('Company', '')}[/bold] "
+        f"(Status={row.get('Status', '')})."
+    )
+    return True
+
+
 @app.command("mark-sent")
 def mark_sent(
-    company: str = typer.Argument(..., help="Company whose send you're recording."),
+    companies: Optional[List[str]] = typer.Argument(
+        None, help="One or more companies whose send you're recording."
+    ),
     day: int = typer.Option(1, "--day", help="Which touch was sent: 1, 3, or 7."),
+    batch: Optional[str] = typer.Option(
+        None, "--batch",
+        help="Mark every eligible row whose Batch matches this label (mutually exclusive with COMPANIES).",
+    ),
     crm_backend: CrmChoice = typer.Option(
         CrmChoice.csv, "--crm",
         help="CRM backend to update: csv (default), notion, or supabase.",
     ),
 ) -> None:
-    """Record that a Day 1/3/7 email went out. Day 1 also moves Status New->Contacted."""
+    """Record that a Day 1/3/7 email went out. Day 1 also moves Status New->Contacted.
+
+    Accepts multiple companies, or `--batch <label>` to mark every Batch-matching row that is
+    eligible for the transition. Any not-found (companies) or ineligible (batch) row is
+    reported and forces a nonzero exit; the rest are still processed.
+    """
     if day not in (1, 3, 7):
         raise typer.BadParameter("--day must be 1, 3, or 7")
-    row = get_backend(crm_backend.value).mark_sent(company, day=day)
-    console.print(
-        f"Marked Day {day} sent for [bold]{row.get('Company', '')}[/bold] "
-        f"(Status={row.get('Status', '')})."
-    )
+    if batch and companies:
+        raise typer.BadParameter("pass either company name(s) OR --batch, not both.")
+    if not batch and not companies:
+        raise typer.BadParameter("name at least one company, or pass --batch <label>.")
+
+    backend = get_backend(crm_backend.value)
+    any_failed = False
+
+    if batch:
+        rows = backend.load()
+        target = batch.strip().lower()
+        matched = [r for r in rows if (r.get("Batch") or "").strip().lower() == target]
+        if not matched:
+            _warn(f"no pipeline rows in batch {batch!r}.")
+            raise typer.Exit(code=1)
+        for r in matched:
+            company = (r.get("Company") or "").strip()
+            if not _day_transition_eligible(r, day):
+                any_failed = True
+                _warn(
+                    f"SKIP {company}: not eligible for Day {day} "
+                    "(already recorded, or a prior touch is missing)."
+                )
+                continue
+            if not _mark_one(backend, company, day):
+                any_failed = True
+    else:
+        seen: set[str] = set()
+        for name in companies:
+            key = name.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not _mark_one(backend, name, day):
+                any_failed = True
+
+    if any_failed:
+        raise typer.Exit(code=1)
 
 
 @app.command("notion-init")
@@ -418,19 +661,12 @@ def gmail_auth(
     )
 
 
-@app.command("gmail-sync-bounces")
-def gmail_sync_bounces() -> None:
-    """Scan Gmail for bounces and add failed recipients (and dead domains) to blocklist.txt.
+def _apply_and_report_bounces(result: gmail.BounceSyncResult) -> bool:
+    """Append failed recipients (and dead domains) to blocklist.txt and report loudly.
 
-    Appends the exact failed email always, plus its domain when the diagnostic indicates a
-    domain-level failure. Dedupes against existing entries. Sends nothing.
+    Returns True if any bounce message was unparseable — the caller turns that into a
+    nonzero exit. Shared by `gmail-sync-bounces` and the `daily` Gmail step.
     """
-    try:
-        result = gmail.sync_bounces()
-    except gmail.GmailError as exc:
-        _warn(str(exc))
-        raise typer.Exit(code=1)
-
     reasons: dict[str, str] = {}
     ordered: list[str] = []
     for bounce in result.bounces:
@@ -465,6 +701,228 @@ def gmail_sync_bounces() -> None:
             f"{len(result.unparseable)} bounce message(s) could not be parsed. "
             "Partial results applied above; exiting nonzero."
         )
+        return True
+    return False
+
+
+@app.command("gmail-sync-bounces")
+def gmail_sync_bounces() -> None:
+    """Scan Gmail for bounces and add failed recipients (and dead domains) to blocklist.txt.
+
+    Appends the exact failed email always, plus its domain when the diagnostic indicates a
+    domain-level failure. Dedupes against existing entries. Sends nothing.
+    """
+    try:
+        result = gmail.sync_bounces()
+    except gmail.GmailError as exc:
+        _warn(str(exc))
+        raise typer.Exit(code=1)
+
+    if _apply_and_report_bounces(result):
+        raise typer.Exit(code=1)
+
+
+# --- squad daily: the bounded, propose-don't-execute campaign loop ---
+
+
+class DailyConfigError(RuntimeError):
+    """Raised when squad.toml is malformed or a required daily setting is absent."""
+
+
+@dataclass
+class DailyConfig:
+    location: str
+    vertical: str
+    count: int
+    service_line: Optional[str]
+
+
+def _read_daily_toml(config_path: Path) -> dict:
+    """Return the [daily] table from squad.toml, or {} if the file is absent. Loud on bad TOML."""
+    path = Path(config_path)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise DailyConfigError(f"{path} is not valid TOML: {exc}")
+    daily = data.get("daily", {})
+    if not isinstance(daily, dict):
+        raise DailyConfigError(f"[daily] in {path} must be a table of key = value pairs.")
+    return daily
+
+
+def _resolve_daily_config(
+    *,
+    location: Optional[str],
+    vertical: Optional[str],
+    count: Optional[int],
+    service_line: Optional[str],
+    config_path: Path,
+) -> DailyConfig:
+    """Merge flags over squad.toml [daily] (flags win). Missing required keys raise loudly."""
+    table = _read_daily_toml(config_path)
+    r_location = location or table.get("location")
+    r_vertical = vertical or table.get("vertical")
+    r_service = service_line or table.get("service_line")
+    if count is not None:
+        r_count = count
+    elif "count" in table:
+        r_count = table.get("count")
+    else:
+        r_count = DAILY_DEFAULT_COUNT
+
+    missing: list[tuple[str, str]] = []
+    if not (isinstance(r_location, str) and r_location.strip()):
+        missing.append(("--location", "location"))
+    if not (isinstance(r_vertical, str) and r_vertical.strip()):
+        missing.append(("--vertical", "vertical"))
+    if missing:
+        details = "; ".join(
+            f"{flag} (or [daily] {key} in {config_path})" for flag, key in missing
+        )
+        raise DailyConfigError(f"missing required daily config: {details}.")
+    if isinstance(r_count, bool) or not isinstance(r_count, int) or r_count <= 0:
+        raise DailyConfigError(
+            f"daily count must be a positive integer (got {r_count!r}) — "
+            f"pass -n/--count or set [daily] count in {config_path}."
+        )
+    return DailyConfig(
+        location=r_location.strip(),
+        vertical=r_vertical.strip(),
+        count=r_count,
+        service_line=(r_service.strip() if isinstance(r_service, str) and r_service.strip() else None),
+    )
+
+
+@app.command("daily")
+def daily(
+    location: Optional[str] = typer.Option(
+        None, "--location", help="City / area to prospect in (overrides squad.toml [daily] location)."
+    ),
+    vertical: Optional[str] = typer.Option(
+        None, "--vertical", help="Target vertical (overrides squad.toml [daily] vertical)."
+    ),
+    count: Optional[int] = typer.Option(
+        None, "-n", "--count", help="Prospects to research (default 10, or [daily] count)."
+    ),
+    service_line: Optional[str] = typer.Option(
+        None, "--service-line", help="Service line (overrides squad.toml [daily] service_line)."
+    ),
+    sender: Optional[str] = typer.Option(
+        None, "--sender", help='Sign staged drafts as "Name | Business" (falls back to $SQUAD_SENDER).'
+    ),
+    crm_backend: CrmChoice = typer.Option(
+        CrmChoice.csv, "--crm", help="CRM backend: csv (default), notion, or supabase."
+    ),
+    gmail_sync: bool = typer.Option(
+        False, "--gmail", help="Run Gmail bounce sync first (needs a token via `squad gmail-auth`)."
+    ),
+    gmail_drafts: bool = typer.Option(
+        False, "--gmail-drafts", help="Also stage a Gmail draft per new lead (Day 1 touch)."
+    ),
+    config_path: Path = typer.Option(
+        DAILY_CONFIG_PATH, "--config", help="Path to squad.toml."
+    ),
+) -> None:
+    """Run the bounded daily loop: bounce sync (opt), research, follow-ups due, stage drafts.
+
+    Proposes work only — NOTHING is ever sent and no Status is auto-advanced. `squad mark-sent`
+    stays the single state-advancing human act.
+    """
+    try:
+        cfg = _resolve_daily_config(
+            location=location, vertical=vertical, count=count,
+            service_line=service_line, config_path=config_path,
+        )
+    except DailyConfigError as exc:
+        _warn(str(exc))
+        raise typer.Exit(code=1)
+
+    backend = get_backend(crm_backend.value)
+    blocklist = Blocklist.load()
+    problems = False
+
+    # 1. Gmail bounce sync — only with --gmail; never folded in silently.
+    console.rule("[bold]1. Gmail bounce sync[/bold]")
+    if gmail_sync:
+        try:
+            result = gmail.sync_bounces()
+        except gmail.GmailError as exc:
+            _warn(str(exc))
+            raise typer.Exit(code=1)
+        if _apply_and_report_bounces(result):
+            problems = True
+        blocklist = Blocklist.load()  # pick up anything freshly blocklisted
+    else:
+        console.print("Gmail bounce sync skipped (--gmail not set).")
+
+    # 2. Research new prospects (chunked path).
+    console.rule("[bold]2. Research new prospects[/bold]")
+    outcome = _run_research(
+        cfg.location, cfg.vertical, cfg.count, cfg.service_line,
+        backend=backend, blocklist=blocklist, seed=None,
+    )
+    _preview_research(outcome.all_rows)
+    console.print(
+        f"Appended {outcome.appended} new lead(s) to {backend.describe()} "
+        f"({outcome.rows_produced - outcome.appended} duplicate(s) skipped)."
+    )
+    if outcome.failed_chunks:
+        problems = True
+        _warn(
+            "research chunk(s) failed: "
+            + ", ".join(str(i) for i in outcome.failed_chunks)
+            + " — raw output saved under out/raw/."
+        )
+
+    # 3. Follow-ups due — surfaced, never sent.
+    console.rule("[bold]3. Follow-ups due[/bold]")
+    rows = backend.load()
+    due = pipeline.followups_due(rows, date.today())
+    if not due:
+        console.print("No follow-ups due.")
+    else:
+        table = Table(title="Follow-ups due")
+        for col in ("Company", "Touch", "Due since", "Outreach file"):
+            table.add_column(col, overflow="fold")
+        for company, touch, since in due:
+            path = Path("out") / "outreach" / f"{pipeline.slugify(company)}.md"
+            if path.is_file():
+                table.add_row(company, touch, since, str(path))
+            else:
+                table.add_row(company, touch, since, f"{path} (MISSING)")
+                _warn(
+                    f"outreach file missing for {company} ({touch}): {path} — "
+                    "draft it before sending."
+                )
+        console.print(table)
+
+    # 4. Stage outreach drafts for eligible new leads (chunked path).
+    console.rule("[bold]4. Stage outreach drafts[/bold]")
+    eligible = _filter_eligible([r for r in rows if r.get("Status") == "New"], blocklist)
+    staged = 0
+    if not eligible:
+        console.print("No eligible new leads to draft.")
+    else:
+        draft_outcome = _draft_eligible(eligible, sender, gmail_drafts=gmail_drafts)
+        staged = len(draft_outcome.written)
+        if draft_outcome.failed_chunks or draft_outcome.gmail_failed:
+            problems = True
+
+    # 5. Review summary — the whole point is that nothing left the building.
+    console.rule("[bold]5. Summary — review, nothing sent[/bold]")
+    console.print(f"Researched: {outcome.returned} returned, {outcome.appended} appended.")
+    console.print(f"Follow-ups due: {len(due)}.")
+    console.print(f"Outreach drafts staged: {staged}.")
+    console.print(
+        "[bold]Nothing was sent[/bold] and no Status changed — "
+        "run `squad mark-sent` to record real sends."
+    )
+
+    if problems:
+        _warn("daily completed with problems (see the loud lines above); exiting nonzero.")
         raise typer.Exit(code=1)
 
 

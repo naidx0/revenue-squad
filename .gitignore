@@ -11,3 +11,4 @@ dist/
 .env
 .env.local
 !examples/**/pipeline.csv
+squad.toml
