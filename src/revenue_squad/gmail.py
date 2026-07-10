@@ -22,6 +22,7 @@ import urllib.parse
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
+from email.message import EmailMessage
 from email.parser import Parser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -31,6 +32,7 @@ import httpx
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+DRAFTS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
 
 # gmail.readonly is needed now (search + read bounces); gmail.compose is requested
 # too so one consent screen also covers Phase 2 draft creation. Full scope URLs.
@@ -542,3 +544,58 @@ def sync_bounces(*, client: httpx.Client | None = None, token_path: Path | str =
         else:
             result.bounces.append(bounce)
     return result
+
+
+# --- draft creation (Gmail API) ---
+
+def build_raw_message(to: str, subject: str, body: str, sender: str) -> str:
+    """Build a base64url-encoded RFC 2822 message (Gmail's `raw` draft format).
+
+    Uses stdlib email.message.EmailMessage so headers/encoding are correct. From is
+    omitted when `sender` is blank — Gmail then fills it with the authorized account.
+    """
+    msg = EmailMessage()
+    msg["To"] = to
+    if sender:
+        msg["From"] = sender
+    msg["Subject"] = subject
+    msg.set_content(body)
+    return base64.urlsafe_b64encode(msg.as_bytes()).rstrip(b"=").decode("ascii")
+
+
+def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    sender: str,
+    *,
+    client: httpx.Client | None = None,
+    token_path: Path | str = TOKEN_PATH,
+) -> str:
+    """Create a Gmail draft (To/Subject/From/body) and return its draft id.
+
+    Refreshes a short-lived access token from the stored refresh token, builds an
+    RFC 2822 message, base64url-encodes it, and POSTs to users/me/drafts. Requires
+    the gmail.compose scope granted at `squad gmail-auth`. Non-2xx (or a missing id)
+    raises GmailError with a body tail — never a silent fallback.
+    """
+    token = _load_token(token_path)
+    http = client or httpx.Client(timeout=GMAIL_TIMEOUT)
+    access_token = refresh_access_token(
+        token["refresh_token"], token["client_id"], token["client_secret"], client=http
+    )
+    raw = build_raw_message(to, subject, body, sender)
+    resp = http.post(
+        DRAFTS_URL, headers=_auth_headers(access_token), json={"message": {"raw": raw}}
+    )
+    if resp.status_code >= 400:
+        raise GmailError(
+            f"Gmail draft creation failed: HTTP {resp.status_code}. "
+            f"body tail: {resp.text[-_BODY_TAIL:]}"
+        )
+    draft_id = resp.json().get("id")
+    if not draft_id:
+        raise GmailError(
+            f"Gmail draft creation returned no draft id. body tail: {resp.text[-_BODY_TAIL:]}"
+        )
+    return draft_id

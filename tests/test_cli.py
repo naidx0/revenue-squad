@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from revenue_squad import cli, crm
 from revenue_squad.gmail import Bounce, BounceSyncResult
+from revenue_squad.supabase import SupabaseError
 
 
 def _lead(company, email="", **extra):
@@ -314,3 +315,111 @@ def test_gmail_sync_no_bounces_says_so(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "No new bounces" in result.output
     assert not (tmp_path / "blocklist.txt").exists()
+
+
+# --- outreach --gmail-drafts: files always land; drafts are attempted on top ---
+
+
+def _write_gmail_token(tmp_path):
+    (tmp_path / ".gmail-token.json").write_text(
+        json.dumps({"refresh_token": "rt", "client_id": "c", "client_secret": "s"})
+    )
+
+
+def test_outreach_gmail_drafts_creates_and_reports(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SQUAD_SENDER", raising=False)
+    _seed_eligible("Acme")
+    _write_gmail_token(tmp_path)
+    monkeypatch.setattr(cli, "run_skill", lambda *a, **k: ({"drafts": [_draft("Acme")]}, ""))
+    calls = []
+
+    def fake_create_draft(to, subject, body, sender, **kw):
+        calls.append((to, subject, body, sender))
+        return "draft-9"
+
+    monkeypatch.setattr(cli.gmail, "create_draft", fake_create_draft)
+    result = CliRunner().invoke(cli.app, ["outreach", "--gmail-drafts"])
+    assert result.exit_code == 0, result.output
+    # Files always land AND a Gmail draft was attempted with the Day 1 touch + lead email.
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()
+    assert calls == [("jane@acme.com", "s", "b", "")]
+    assert "draft-9" in result.output
+
+
+def test_outreach_gmail_drafts_failure_nonzero_files_preserved(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_eligible("Acme")
+    _write_gmail_token(tmp_path)
+    monkeypatch.setattr(cli, "run_skill", lambda *a, **k: ({"drafts": [_draft("Acme")]}, ""))
+
+    def boom(*a, **k):
+        raise cli.gmail.GmailError("Gmail draft creation failed: HTTP 403")
+
+    monkeypatch.setattr(cli.gmail, "create_draft", boom)
+    result = CliRunner().invoke(cli.app, ["outreach", "--gmail-drafts"])
+    assert result.exit_code == 1
+    # The file is still on disk, and the failure is loud.
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()
+    assert "GMAIL DRAFT FAILED" in result.output
+
+
+def test_outreach_gmail_drafts_no_token_is_loud_and_preserves_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no .gmail-token.json here
+    _seed_eligible("Acme")
+    monkeypatch.setattr(cli, "run_skill", lambda *a, **k: ({"drafts": [_draft("Acme")]}, ""))
+
+    def must_not_call(*a, **k):
+        raise AssertionError("create_draft must not run without a token")
+
+    monkeypatch.setattr(cli.gmail, "create_draft", must_not_call)
+    result = CliRunner().invoke(cli.app, ["outreach", "--gmail-drafts"])
+    assert result.exit_code == 1
+    assert "gmail-auth" in result.output
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()  # files preserved
+
+
+def test_outreach_without_gmail_drafts_flag_never_touches_gmail(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_eligible("Acme")
+    monkeypatch.setattr(cli, "run_skill", lambda *a, **k: ({"drafts": [_draft("Acme")]}, ""))
+
+    def must_not_call(*a, **k):
+        raise AssertionError("gmail.create_draft must not run without --gmail-drafts")
+
+    monkeypatch.setattr(cli.gmail, "create_draft", must_not_call)
+    result = CliRunner().invoke(cli.app, ["outreach"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "out" / "outreach" / "acme.md").exists()
+
+
+# --- supabase-init: prints setup steps + schema path, then verifies the table ---
+
+
+def test_supabase_init_reachable_says_table_ready(monkeypatch):
+    monkeypatch.setattr(cli.supabase, "verify_table", lambda **kw: None)
+    result = CliRunner().invoke(cli.app, ["supabase-init"])
+    assert result.exit_code == 0, result.output
+    assert "table ready" in result.output
+    assert "supabase_schema.sql" in result.output   # the file path is printed
+    assert "SQL Editor" in result.output             # the paste step is spelled out
+
+
+def test_supabase_init_table_missing_is_actionable(monkeypatch):
+    def boom(**kw):
+        raise SupabaseError("Supabase pipeline table not found. ... supabase_schema.sql ...")
+
+    monkeypatch.setattr(cli.supabase, "verify_table", boom)
+    result = CliRunner().invoke(cli.app, ["supabase-init"])
+    assert result.exit_code == 1
+    assert "supabase_schema.sql" in result.output
+
+
+def test_supabase_init_missing_env_is_loud(monkeypatch):
+    def boom(**kw):
+        raise SupabaseError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must both be set. ...")
+
+    monkeypatch.setattr(cli.supabase, "verify_table", boom)
+    result = CliRunner().invoke(cli.app, ["supabase-init"])
+    assert result.exit_code == 1
+    assert "SUPABASE_URL" in result.output

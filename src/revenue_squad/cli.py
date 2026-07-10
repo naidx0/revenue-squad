@@ -12,7 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import gmail, pipeline, places
+from . import gmail, pipeline, places, supabase
 from .backend import CrmChoice, get_backend
 from .blocklist import Blocklist, append_entries
 from .notion import NotionBackend
@@ -75,7 +75,8 @@ def research(
         None, "--service-line", help="Service line you're pitching (stored on each lead)."
     ),
     crm_backend: CrmChoice = typer.Option(
-        CrmChoice.csv, "--crm", help="CRM backend to append leads to: csv (default) or notion."
+        CrmChoice.csv, "--crm",
+        help="CRM backend to append leads to: csv (default), notion, or supabase.",
     ),
     seed: Optional[places.SeedSource] = typer.Option(
         None, "--seed", help="Optional lead seed source (places) — needs GOOGLE_MAPS_API_KEY."
@@ -127,10 +128,15 @@ def outreach(
         None, help="Companies to draft for. Default: all eligible Status=New rows."
     ),
     crm_backend: CrmChoice = typer.Option(
-        CrmChoice.csv, "--crm", help="CRM backend to read leads from: csv (default) or notion."
+        CrmChoice.csv, "--crm",
+        help="CRM backend to read leads from: csv (default), notion, or supabase.",
     ),
     sender: Optional[str] = typer.Option(
         None, "--sender", help='Sign drafts as "Name | Business" (falls back to $SQUAD_SENDER).'
+    ),
+    gmail_drafts: bool = typer.Option(
+        False, "--gmail-drafts",
+        help="Also create a Gmail draft per lead (Day 1 touch). Requires `squad gmail-auth`.",
     ),
 ) -> None:
     """Draft Day 1/3/7 cold outreach for eligible leads. Never changes Status."""
@@ -160,6 +166,7 @@ def outreach(
 
     prose = ""
     drafted_keys: set[str] = set()
+    gmail_failed = False
     if not eligible:
         console.print("No eligible leads to draft.")
         # Explicit targets that produced nothing is unfulfilled work, not "nothing to
@@ -168,7 +175,9 @@ def outreach(
         if not explicit:
             raise typer.Exit(code=0)
     else:
-        prose, drafted_keys = _draft_eligible(eligible, sender)
+        prose, drafted_keys, gmail_failed = _draft_eligible(
+            eligible, sender, gmail_drafts=gmail_drafts
+        )
 
     if explicit:
         # Every named company must have produced a written draft; anything missing
@@ -187,6 +196,9 @@ def outreach(
                 err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
             _warn("Unfulfilled — no outreach draft written for: " + ", ".join(unfulfilled))
             raise typer.Exit(code=1)
+        # Draft FILES all landed; a Gmail draft failure is still a nonzero outcome.
+        if gmail_failed:
+            raise typer.Exit(code=1)
         return
 
     # No-args mode: eligible leads went in but some/all came back with no draft.
@@ -200,13 +212,16 @@ def outreach(
             err.print(f"[yellow]Model explanation:[/yellow] {prose.strip()}")
         _warn("No outreach draft returned for: " + ", ".join(missing))
         raise typer.Exit(code=1)
+    if gmail_failed:
+        raise typer.Exit(code=1)
 
 
 def _draft_eligible(
-    eligible: list[dict[str, str]], sender: Optional[str]
-) -> tuple[str, set[str]]:
+    eligible: list[dict[str, str]], sender: Optional[str], *, gmail_drafts: bool = False
+) -> tuple[str, set[str], bool]:
     """Run the outreach skill for eligible leads, write each returned draft, and return
-    (model prose, set of drafted Company keys). Any draft that comes back is written."""
+    (model prose, set of drafted Company keys, gmail_failed). Any draft that comes back is
+    written to disk; with gmail_drafts, each is also pushed to Gmail as a Day 1 draft."""
     lead_payload = [
         {
             "company": r.get("Company", ""),
@@ -240,6 +255,7 @@ def _draft_eligible(
     by_company = {r.get("Company", "").strip().lower(): r for r in eligible}
     written: list[tuple[str, Path]] = []
     drafted_keys: set[str] = set()
+    for_gmail: list[tuple[str, dict[str, str], dict]] = []  # (company, row, draft)
     for draft in drafts:
         company = (draft.get("company") or "").strip()
         row = by_company.get(company.lower())
@@ -250,10 +266,51 @@ def _draft_eligible(
         path.write_text(_render_draft(company, row.get("Email", ""), draft))
         written.append((company, path))
         drafted_keys.add(row.get("Company", "").strip().lower())
+        for_gmail.append((company, row, draft))
 
     _preview_outreach(written)
     console.print(f"\nWrote {len(written)} outreach file(s) under {out_dir}.")
-    return prose, drafted_keys
+
+    gmail_failed = False
+    if gmail_drafts and for_gmail:
+        gmail_failed = _create_gmail_drafts(for_gmail, sender)
+    return prose, drafted_keys, gmail_failed
+
+
+def _create_gmail_drafts(
+    entries: list[tuple[str, dict[str, str], dict]], sender: Optional[str]
+) -> bool:
+    """Create one Gmail draft per lead (Day 1 touch only). Returns True if any failed.
+
+    The draft FILES are already on disk before this runs, so any Gmail failure never
+    removes them — the message says so. Reports every created draft id and every
+    per-lead failure loudly. A missing token short-circuits with one loud pointer to
+    `squad gmail-auth` rather than one identical error per lead.
+    """
+    if not Path(gmail.TOKEN_PATH).is_file():
+        _warn(
+            f"No Gmail token at {gmail.TOKEN_PATH} — run `squad gmail-auth --client-secret "
+            "<path>` first. Draft files are on disk; no Gmail drafts were created."
+        )
+        return True
+
+    from_identity = _resolve_sender(sender)
+    any_failed = False
+    for company, row, draft in entries:
+        touch = draft.get("day1") or {}
+        to = row.get("Email", "")
+        try:
+            draft_id = gmail.create_draft(
+                to, touch.get("subject", ""), touch.get("body", ""), from_identity
+            )
+        except gmail.GmailError as exc:
+            any_failed = True
+            _warn(f"GMAIL DRAFT FAILED for {company} (file kept on disk): {exc}")
+            continue
+        console.print(
+            f"Created Gmail draft [bold]{draft_id}[/bold] for {company} (To: {to})."
+        )
+    return any_failed
 
 
 @app.command("propose")
@@ -286,7 +343,8 @@ def mark_sent(
     company: str = typer.Argument(..., help="Company whose send you're recording."),
     day: int = typer.Option(1, "--day", help="Which touch was sent: 1, 3, or 7."),
     crm_backend: CrmChoice = typer.Option(
-        CrmChoice.csv, "--crm", help="CRM backend to update: csv (default) or notion."
+        CrmChoice.csv, "--crm",
+        help="CRM backend to update: csv (default), notion, or supabase.",
     ),
 ) -> None:
     """Record that a Day 1/3/7 email went out. Day 1 also moves Status New->Contacted."""
@@ -313,6 +371,32 @@ def notion_init(
         "\nExport this to use `--crm notion`:\n"
         f"  export NOTION_DATA_SOURCE_ID={result['data_source_id']}"
     )
+
+
+def _supabase_schema_path() -> Path:
+    """Locate supabase_schema.sql (repo root of a source checkout); bare name otherwise."""
+    candidate = Path(__file__).resolve().parents[2] / "supabase_schema.sql"
+    return candidate if candidate.is_file() else Path("supabase_schema.sql")
+
+
+@app.command("supabase-init")
+def supabase_init() -> None:
+    """Print the Supabase pipeline-table setup steps, then verify the table responds."""
+    schema_path = _supabase_schema_path()
+    console.print(
+        "To use `--crm supabase`, create the pipeline table once:\n"
+        "  1. Open your Supabase project -> SQL Editor -> New query.\n"
+        f"  2. Paste the contents of {schema_path} and click Run.\n"
+        "  3. Export your credentials (Project Settings -> API):\n"
+        "       export SUPABASE_URL=https://<ref>.supabase.co\n"
+        "       export SUPABASE_SERVICE_ROLE_KEY=<service_role secret>\n"
+    )
+    try:
+        supabase.verify_table()
+    except supabase.SupabaseError as exc:
+        _warn(str(exc))
+        raise typer.Exit(code=1)
+    console.print("[green]table ready[/green] — Supabase pipeline table is reachable.")
 
 
 @app.command("gmail-auth")

@@ -3,6 +3,7 @@ capture), no real browser: httpx is driven through MockTransport; the loopback s
 is exercised with a real 127.0.0.1 GET fired from a thread."""
 
 import base64
+import email
 import hashlib
 import json
 import re
@@ -321,3 +322,90 @@ def test_sync_bounces_no_token_raises_naming_auth(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(gmail.GmailError, match="gmail-auth"):
         gmail.sync_bounces()
+
+
+# --- draft creation (RFC 2822 correctness, endpoint/headers, failure paths) ---
+
+def _draft_client(captured, *, drafts_response=None):
+    """A MockTransport client: TOKEN_URL -> access token; DRAFTS_URL -> captured + response."""
+    def handler(request):
+        if str(request.url).startswith(gmail.TOKEN_URL):
+            return httpx.Response(200, json={"access_token": "at-draft"})
+        if str(request.url) == gmail.DRAFTS_URL:
+            captured["method"] = request.method
+            captured["headers"] = dict(request.headers)
+            captured["body"] = json.loads(request.content)
+            return drafts_response or httpx.Response(200, json={"id": "draft-123"})
+        raise AssertionError(f"unexpected request: {request.url}")
+    return _client(handler)
+
+
+def _decode_raw(raw: str):
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+    return email.message_from_bytes(decoded), decoded.decode()
+
+
+def test_create_draft_builds_valid_mime(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    captured = {}
+    draft_id = gmail.create_draft(
+        "jane@acme.test",
+        "Quick question",
+        "Hi Jane,\n\nAre you the right person for X?",
+        "Dana Lee | Northlight",
+        client=_draft_client(captured),
+    )
+    assert draft_id == "draft-123"
+    msg, decoded = _decode_raw(captured["body"]["message"]["raw"])
+    assert msg["To"] == "jane@acme.test"
+    assert msg["Subject"] == "Quick question"
+    assert msg["From"] == "Dana Lee | Northlight"
+    assert "Are you the right person for X?" in decoded
+
+
+def test_create_draft_endpoint_and_auth_header(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    captured = {}
+    gmail.create_draft("a@b.test", "s", "b", "", client=_draft_client(captured))
+    assert captured["method"] == "POST"
+    assert captured["headers"]["authorization"] == "Bearer at-draft"
+
+
+def test_create_draft_omits_from_when_sender_blank(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    captured = {}
+    gmail.create_draft("a@b.test", "s", "body", "", client=_draft_client(captured))
+    msg, _ = _decode_raw(captured["body"]["message"]["raw"])
+    assert msg["From"] is None
+    assert msg["To"] == "a@b.test"
+
+
+def test_create_draft_http_error_surfaces_body(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    captured = {}
+    client = _draft_client(
+        captured, drafts_response=httpx.Response(403, text="insufficientPermissions")
+    )
+    with pytest.raises(gmail.GmailError) as exc:
+        gmail.create_draft("a@b.test", "s", "b", "", client=client)
+    assert "HTTP 403" in str(exc.value)
+    assert "insufficientPermissions" in str(exc.value)
+
+
+def test_create_draft_missing_id_raises(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_token(tmp_path)
+    captured = {}
+    client = _draft_client(captured, drafts_response=httpx.Response(200, json={}))
+    with pytest.raises(gmail.GmailError, match="no draft id"):
+        gmail.create_draft("a@b.test", "s", "b", "", client=client)
+
+
+def test_create_draft_no_token_raises_naming_auth(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no .gmail-token.json -> _load_token raises before any request
+    with pytest.raises(gmail.GmailError, match="gmail-auth"):
+        gmail.create_draft("a@b.test", "s", "b", "")

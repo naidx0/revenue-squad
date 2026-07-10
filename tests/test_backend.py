@@ -5,6 +5,7 @@ from revenue_squad import crm
 from revenue_squad.backend import CrmChoice, CsvBackend, get_backend
 from revenue_squad.cli import app
 from revenue_squad.notion import NotionBackend
+from revenue_squad.supabase import SupabaseBackend
 
 
 def _lead(company, email="", **extra):
@@ -28,6 +29,12 @@ def test_get_backend_notion_routes_via_env(monkeypatch):
     monkeypatch.setenv("NOTION_TOKEN", "secret_x")
     monkeypatch.setenv("NOTION_DATA_SOURCE_ID", "ds_1")
     assert isinstance(get_backend(CrmChoice.notion.value), NotionBackend)
+
+
+def test_get_backend_supabase_routes_via_env(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://ref.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc_key")
+    assert isinstance(get_backend(CrmChoice.supabase.value), SupabaseBackend)
 
 
 def test_csv_backend_delegates_to_crm(tmp_path):

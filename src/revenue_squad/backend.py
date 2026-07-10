@@ -1,7 +1,8 @@
 """CRM backend seam: pick where the lead pipeline is stored.
 
 CsvBackend wraps crm.py (the local ./pipeline.csv) unchanged; NotionBackend
-(notion.py) talks to the Notion REST API. `--crm csv|notion` selects one.
+(notion.py) talks to the Notion REST API; SupabaseBackend (supabase.py) talks to
+PostgREST. `--crm csv|notion|supabase` selects one.
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ from typing import Protocol
 
 from . import crm
 from .notion import NotionBackend
+from .supabase import SupabaseBackend
 
 
 class CrmChoice(str, Enum):
     csv = "csv"
     notion = "notion"
+    supabase = "supabase"
 
 
 class CrmBackend(Protocol):
@@ -49,4 +52,6 @@ def get_backend(choice: str) -> CrmBackend:
         return CsvBackend()
     if choice == CrmChoice.notion.value:
         return NotionBackend.from_env()
+    if choice == CrmChoice.supabase.value:
+        return SupabaseBackend.from_env()
     raise ValueError(f"unknown crm backend: {choice!r}")
